@@ -11,7 +11,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { initAsr, asrStatus, attachAsrSocket } from './asr.js';
-import { understand } from './agent.js';
+import { understand, understandStream } from './agent.js';
 import { arkStatus } from './volc.js';
 import { ensureDns, dnsStatus } from './dns.js';
 
@@ -31,6 +31,26 @@ app.post('/api/agent', async (req, res) => {
     console.error('[agent]', e.message);
     res.status(502).json({ error: e.message, degraded: true });
   }
+});
+
+/** v1.1：SSE 流式拆解 —— 边生成边下发 op，前端逐笔绘制 */
+app.post('/api/agent/stream', async (req, res) => {
+  const { text, scene, snapshot } = req.body ?? {};
+  if (!text || typeof text !== 'string') return res.status(400).json({ error: 'text 必填' });
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const send = ev => res.write(`data: ${JSON.stringify(ev)}\n\n`);
+  try {
+    await understandStream({ text: text.slice(0, 500), scene, snapshot }, send);
+  } catch (e) {
+    console.error('[agent/stream]', e.message);
+    send({ type: 'error', message: e.message });
+  }
+  res.end();
 });
 
 app.get('/api/health', async (_req, res) => {

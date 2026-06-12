@@ -2,7 +2,7 @@
  * L1/L2 指令理解：把自然语言（+可选画布快照）拆解为绘图 DSL Ops。
  * 输出经 schema 校验，幻觉操作一律丢弃。
  */
-import { chat } from './volc.js';
+import { chat, chatStream } from './volc.js';
 
 const SHAPES = ['circle', 'ellipse', 'rect', 'triangle', 'line', 'arrow', 'star', 'heart', 'polygon', 'text'];
 const OPS = ['add', 'modify', 'delete', 'select', 'undo', 'redo', 'clear', 'background', 'save', 'say', 'help'];
@@ -68,6 +68,81 @@ function extractJson(text) {
     try { return JSON.parse(body.slice(start, end)); } catch { /* shrink */ }
   }
   return null;
+}
+
+function buildMessages({ text, scene, snapshot }) {
+  const sceneBrief = scene.slice(-40).map(s =>
+    `${s.id}:${s.name || s.shape}(${s.shape},${s.fill || ''},中心${Math.round(s.x)},${Math.round(s.y)})`
+  ).join('; ') || '（空画布）';
+  const userContent = snapshot
+    ? [
+        { type: 'image_url', image_url: { url: snapshot, detail: 'low' } },
+        { type: 'text', text: `画布当前对象: ${sceneBrief}\n用户语音指令: ${text}` },
+      ]
+    : `画布当前对象: ${sceneBrief}\n用户语音指令: ${text}`;
+  return [
+    { role: 'system', content: SYSTEM },
+    { role: 'user', content: userContent },
+  ];
+}
+
+/**
+ * 流式理解：模型边生成边抽取完整的 op 对象，实现"边拆解边作画"。
+ * @param {function} onEvent ({type:'op',op}|{type:'done',reply,ops,llmMs}|{type:'error',message})
+ */
+export async function understandStream({ text, scene = [], snapshot }, onEvent) {
+  const t0 = Date.now();
+  let emitted = 0;
+  const seen = [];
+  // 增量抽取 "ops":[ {..},{..} ] 数组内深度 1 的完整对象
+  const tryExtract = (full) => {
+    const start = full.search(/"ops"\s*:\s*\[/);
+    if (start < 0) return;
+    let i = full.indexOf('[', start) + 1;
+    let depth = 0, objStart = -1, inStr = false, esc = false;
+    for (; i < full.length; i++) {
+      const c = full[i];
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') inStr = !inStr;
+      if (inStr) continue;
+      if (c === '{') { if (depth === 0) objStart = i; depth++; }
+      else if (c === '}') {
+        depth--;
+        if (depth === 0 && objStart >= 0) {
+          const raw = full.slice(objStart, i + 1);
+          objStart = -1;
+          if (seen.length < emitted + 1) { /* noop */ }
+          if (!seen.includes(raw)) {
+            seen.push(raw);
+            try {
+              const [op] = validateOps([JSON.parse(raw)]);
+              if (op && seen.length > emitted) {
+                emitted = seen.length;
+                onEvent({ type: 'op', op, t: Date.now() - t0 });
+              }
+            } catch { /* 不完整或非法，忽略 */ }
+          }
+        }
+      } else if (c === ']' && depth === 0) break;
+    }
+  };
+
+  const { content, model } = await chatStream({
+    kind: snapshot ? 'vision' : 'text',
+    messages: buildMessages({ text, scene, snapshot }),
+    onDelta: (_d, full) => { try { tryExtract(full); } catch { /* 容错 */ } },
+  });
+  const parsed = extractJson(content) ?? {};
+  const ops = validateOps(parsed.ops);
+  onEvent({
+    type: 'done',
+    ops, // 全量（供客户端校对补漏）
+    emitted,
+    reply: typeof parsed.reply === 'string' ? parsed.reply.slice(0, 60) : (ops.length ? '画好了' : '我没太听懂，换个说法试试'),
+    model,
+    llmMs: Date.now() - t0,
+  });
 }
 
 /**
