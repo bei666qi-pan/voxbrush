@@ -65,7 +65,7 @@ export async function signedOpenApiRequest({ ak, sk, service, region = REGION, a
       Authorization: `HMAC-SHA256 Credential=${ak}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
     },
     body: method === 'GET' ? undefined : payload,
-    signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 30000)),
+    signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 60000)),
   });
   if (rawResponse) return res;
   const json = await res.json().catch(() => ({}));
@@ -165,10 +165,12 @@ export function knownEndpoints() { return epList ?? []; }
 // ---------------- Chat Completions ----------------
 let authMode = null; // 'api-key' | 'signed'
 
-async function chatOnce({ model, messages, tools, temperature = 0.2, maxTokens = 4096, responseFormat }) {
+async function chatOnce({ model, messages, tools, temperature = 0.2, maxTokens = 4096, responseFormat, thinking = 'disabled' }) {
   const body = { model, messages, temperature, max_tokens: maxTokens };
   if (tools) body.tools = tools;
   if (responseFormat) body.response_format = responseFormat;
+  // seed-1.6 系列默认深度思考，显式关闭以保证交互延迟（不支持该字段的模型自动重试去除）
+  if (thinking) body.thinking = { type: thinking };
 
   let res, json;
   let apiKey = null;
@@ -180,10 +182,23 @@ async function chatOnce({ model, messages, tools, temperature = 0.2, maxTokens =
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 30000)),
+      signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 60000)),
     });
     json = await res.json().catch(() => ({}));
     if (res.ok) { authMode = 'api-key'; return json; }
+    // thinking 字段不被支持时去除重试
+    if (res.status === 400 && body.thinking && /thinking/i.test(JSON.stringify(json))) {
+      delete body.thinking;
+      const r2 = await fetch(`https://${ARK_HOST}/api/v3/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 60000)),
+      });
+      json = await r2.json().catch(() => ({}));
+      if (r2.ok) { authMode = 'api-key'; return json; }
+      res = r2;
+    }
   } else {
     // 兜底：对 /api/v3 直接 SigV4 签名（service=ark）
     res = await signedOpenApiRequest({
