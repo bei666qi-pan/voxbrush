@@ -4,10 +4,10 @@ import { CANVAS_H, CANVAS_W, Op, SceneState } from './engine/types';
 import { needsVision, parseLocal } from './voice/parser';
 import { AsrEngine, ServerAsr, WebSpeechAsr } from './voice/asrClient';
 import { speak } from './voice/tts';
-import { callAgent } from './agent/client';
+import { callAgentStream } from './agent/client';
 
 type Lane = 'L0 本地' | 'L1 大模型' | 'L2 多模态';
-interface LogItem { id: number; text: string; lane?: Lane; ops?: number; ms?: number; asrMs?: number; err?: string; }
+interface LogItem { id: number; text: string; lane?: Lane; ops?: number; ms?: number; asrMs?: number; firstMs?: number; err?: string; }
 
 const HELP_LINES = [
   '「画一个红色的圆」「在左上角画三颗星星」',
@@ -124,9 +124,10 @@ export default function App() {
       return;
     }
 
-    // 升级 L1/L2
+    // 升级 L1/L2（v1.1：SSE 流式拆解，边生成边逐笔绘制）
     setThinking(true);
     const vision = needsVision(trimmed) && sceneRef.current.nodes.length > 0;
+    const lane: Lane = vision ? 'L2 多模态' : 'L1 大模型';
     let snapshot: string | undefined;
     if (vision && canvasRef.current) {
       const small = document.createElement('canvas');
@@ -134,20 +135,41 @@ export default function App() {
       small.getContext('2d')!.drawImage(canvasRef.current, 0, 0, 480, 300);
       snapshot = small.toDataURL('image/jpeg', 0.7);
     }
+
+    let started = false, opCount = 0, firstMs = 0;
+    const beginBatch = () => {
+      undoStack.current.push(JSON.parse(JSON.stringify(sceneRef.current)) as SceneState);
+      if (undoStack.current.length > 100) undoStack.current.shift();
+      redoStack.current = [];
+    };
+    const applyStreamOp = (op: Op) => {
+      const { effects } = applyOps(sceneRef.current, [op]);
+      if (effects.save) downloadPng();
+      setObjCount(sceneRef.current.nodes.length);
+    };
+
     try {
-      const res = await callAgent(trimmed, sceneBrief(sceneRef.current), snapshot);
-      if (res.error) {
-        pushLog({ text: trimmed, lane: vision ? 'L2 多模态' : 'L1 大模型', err: res.error });
-        say('云端大脑暂时联系不上，简单指令还是可以用的');
-      } else {
-        execute(res.ops, res.reply);
-        pushLog({
-          text: trimmed, lane: vision ? 'L2 多模态' : 'L1 大模型',
-          ops: res.ops.length, ms: Math.round(performance.now() - t0), asrMs,
-        });
-      }
+      await callAgentStream(trimmed, sceneBrief(sceneRef.current), snapshot, ev => {
+        if (ev.type === 'op' && ev.op) {
+          if (!started) { beginBatch(); started = true; firstMs = Math.round(performance.now() - t0); }
+          applyStreamOp(ev.op);
+          opCount++;
+        } else if (ev.type === 'done') {
+          const rest = (ev.ops ?? []).slice(ev.emitted ?? opCount);
+          if (rest.length) {
+            if (!started) { beginBatch(); started = true; }
+            rest.forEach(applyStreamOp);
+            opCount += rest.length;
+          }
+          if (opCount || ev.reply) say(ev.reply ?? '画好了');
+          pushLog({ text: trimmed, lane, ops: opCount, ms: Math.round(performance.now() - t0), firstMs, asrMs });
+        } else if (ev.type === 'error') {
+          pushLog({ text: trimmed, lane, err: ev.message });
+          say('云端大脑暂时联系不上，简单指令还是可以用的');
+        }
+      });
     } catch (e) {
-      pushLog({ text: trimmed, lane: 'L1 大模型', err: (e as Error).message });
+      pushLog({ text: trimmed, lane, err: (e as Error).message });
       say('这个指令我没处理好，换个说法试试');
     } finally {
       setThinking(false);
@@ -231,6 +253,7 @@ export default function App() {
                 <div className="log-meta">
                   {l.lane && <span className="badge" style={{ background: laneColor(l.lane) }}>{l.lane}</span>}
                   {l.asrMs != null && <span className="kv">ASR {l.asrMs}ms</span>}
+                  {!!l.firstMs && <span className="kv">首笔 {l.firstMs}ms</span>}
                   {l.ms != null && <span className="kv">理解+执行 {l.ms}ms</span>}
                   {l.ops != null && <span className="kv">{l.ops} ops</span>}
                   {l.err && <span className="kv err">{l.err.slice(0, 60)}</span>}

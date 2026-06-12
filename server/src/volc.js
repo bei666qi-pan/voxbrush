@@ -216,6 +216,52 @@ async function chatOnce({ model, messages, tools, temperature = 0.2, maxTokens =
   throw err;
 }
 
+/** 流式 Chat：逐块回调 content 增量 */
+export async function chatStream({ kind = 'text', onDelta, ...args }) {
+  const candidates = kind === 'vision' ? VISION_CANDIDATES : TEXT_CANDIDATES;
+  const model = await resolveModel(kind, candidates);
+  const apiKey = await getArkApiKey();
+  const body = {
+    model, stream: true,
+    messages: args.messages,
+    temperature: args.temperature ?? 0.3,
+    max_tokens: args.maxTokens ?? 4096,
+    thinking: { type: 'disabled' },
+  };
+  const res = await fetch(`https://${ARK_HOST}/api/v3/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 60000)),
+  });
+  if (!res.ok || !res.body) {
+    const json = await res.json().catch(() => ({}));
+    const err = new Error(`Ark stream ${res.status}: ${JSON.stringify(json?.error ?? json).slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let full = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';
+    for (const line of lines) {
+      const m = line.match(/^data:\s*(.*)$/);
+      if (!m || m[1] === '[DONE]') continue;
+      try {
+        const delta = JSON.parse(m[1])?.choices?.[0]?.delta?.content ?? '';
+        if (delta) { full += delta; onDelta?.(delta, full); }
+      } catch { /* 跳过非 JSON 行 */ }
+    }
+  }
+  return { content: full, model };
+}
+
 const resolved = { text: null, vision: null };
 
 async function resolveModel(kind, candidates) {
