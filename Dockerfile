@@ -1,6 +1,9 @@
-# VoxBrush 声笔 —— 多阶段构建（针对国内网络优化：npmmirror + hf-mirror）
+# VoxBrush 声笔 —— 多阶段构建（针对国内网络优化：nju 镜像 + npmmirror + hf-mirror）
+ARG NODE_IMAGE=docker.nju.edu.cn/library/node:20-bookworm-slim
+ARG DEBIAN_IMAGE=docker.nju.edu.cn/library/debian:bookworm-slim
+
 # ---------- 阶段 1：构建前端 ----------
-FROM node:20-bookworm-slim AS client-build
+FROM ${NODE_IMAGE} AS client-build
 WORKDIR /app/client
 RUN npm config set registry https://registry.npmmirror.com
 COPY client/package.json ./
@@ -9,14 +12,14 @@ COPY client/ ./
 RUN npm run build
 
 # ---------- 阶段 2：服务端依赖（含 sherpa-onnx 原生模块） ----------
-FROM node:20-bookworm-slim AS server-deps
+FROM ${NODE_IMAGE} AS server-deps
 WORKDIR /app/server
 RUN npm config set registry https://registry.npmmirror.com
 COPY server/package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
 # ---------- 阶段 3：下载流式 ASR 模型（中英双语 Zipformer int8） ----------
-FROM debian:bookworm-slim AS asr-model
+FROM ${DEBIAN_IMAGE} AS asr-model
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /models/asr
 ARG ASR_REPO=csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20
@@ -32,7 +35,7 @@ RUN set -eux; \
     test -s encoder-epoch-99-avg-1.int8.onnx && test -s tokens.txt
 
 # ---------- 阶段 4：运行时 ----------
-FROM node:20-bookworm-slim
+FROM ${NODE_IMAGE}
 ENV NODE_ENV=production PORT=8080
 WORKDIR /app/server
 COPY --from=server-deps /app/server/node_modules ./node_modules
