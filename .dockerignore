@@ -2,5 +2,5 @@
 **/dist
 .git
 docs
-*.md
+README.md
 .env*

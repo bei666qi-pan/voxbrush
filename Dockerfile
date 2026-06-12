@@ -1,6 +1,5 @@
 # VoxBrush 声笔 —— 多阶段构建（针对国内网络优化：nju 镜像 + npmmirror + hf-mirror）
 ARG NODE_IMAGE=docker.m.daocloud.io/library/node:20-bookworm-slim
-ARG DEBIAN_IMAGE=docker.m.daocloud.io/library/debian:bookworm-slim
 
 # ---------- 阶段 1：构建前端 ----------
 FROM ${NODE_IMAGE} AS client-build
@@ -18,21 +17,12 @@ RUN npm config set registry https://registry.npmmirror.com
 COPY server/package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
-# ---------- 阶段 3：下载流式 ASR 模型（中英双语 Zipformer int8） ----------
-FROM ${DEBIAN_IMAGE} AS asr-model
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+# ---------- 阶段 3：下载流式 ASR 模型（中英双语 Zipformer int8，hf-mirror 国内源，零 apt 依赖） ----------
+FROM ${NODE_IMAGE} AS asr-model
 WORKDIR /models/asr
 ARG ASR_REPO=csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20
-# 优先 hf-mirror（国内），回退 huggingface / GitHub Releases
-RUN set -eux; \
-    for base in "https://hf-mirror.com/${ASR_REPO}/resolve/main" "https://huggingface.co/${ASR_REPO}/resolve/main"; do \
-      ok=1; \
-      for f in encoder-epoch-99-avg-1.int8.onnx decoder-epoch-99-avg-1.onnx joiner-epoch-99-avg-1.int8.onnx tokens.txt; do \
-        curl -fL --retry 3 --connect-timeout 20 -o "$f" "$base/$f" || { ok=0; break; }; \
-      done; \
-      [ "$ok" = "1" ] && break || rm -f *.onnx tokens.txt; \
-    done; \
-    test -s encoder-epoch-99-avg-1.int8.onnx && test -s tokens.txt
+COPY scripts/download-asr.mjs /tmp/download-asr.mjs
+RUN node /tmp/download-asr.mjs
 
 # ---------- 阶段 4：运行时 ----------
 FROM ${NODE_IMAGE}
