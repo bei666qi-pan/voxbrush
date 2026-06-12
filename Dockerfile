@@ -1,6 +1,6 @@
 # VoxBrush 声笔 —— 多阶段构建（针对国内网络优化：nju 镜像 + npmmirror + hf-mirror）
-ARG NODE_IMAGE=docker.nju.edu.cn/library/node:20-bookworm-slim
-ARG DEBIAN_IMAGE=docker.nju.edu.cn/library/debian:bookworm-slim
+ARG NODE_IMAGE=docker.m.daocloud.io/library/node:20-bookworm-slim
+ARG DEBIAN_IMAGE=docker.m.daocloud.io/library/debian:bookworm-slim
 
 # ---------- 阶段 1：构建前端 ----------
 FROM ${NODE_IMAGE} AS client-build
