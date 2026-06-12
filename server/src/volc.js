@@ -182,7 +182,7 @@ export async function chat({ kind = 'text', ...args }) {
 }
 
 export async function arkStatus() {
-  const out = { auth: 'unknown', authMode, textModel: resolved.text, visionModel: resolved.vision, keyErrors };
+  const out = { auth: 'unknown', authMode, textModel: resolved.text, visionModel: resolved.vision };
   try {
     try {
       await getArkApiKey();
@@ -190,6 +190,7 @@ export async function arkStatus() {
     } catch {
       out.auth = 'fallback-signed';
     }
+    out.keyErrors = keyErrors;
     try { out.textModel = await resolveModel('text', TEXT_CANDIDATES); } catch (e) { out.modelError = e.message; }
     try { out.visionModel = await resolveModel('vision', VISION_CANDIDATES); } catch { /* 已在 modelError 体现 */ }
     out.authMode = authMode;
