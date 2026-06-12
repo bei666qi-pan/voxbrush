@@ -28,14 +28,14 @@ const VISION_CANDIDATES = (process.env.ARK_VISION_MODEL ? [process.env.ARK_VISIO
 function hmac(key, data) { return crypto.createHmac('sha256', key).update(data, 'utf8').digest(); }
 function sha256hex(data) { return crypto.createHash('sha256').update(data, 'utf8').digest('hex'); }
 
-/** 火山引擎 OpenAPI SigV4 签名请求（通用：支持 GET/POST + 自定义 service/region/query） */
-export async function signedOpenApiRequest({ ak, sk, service, region = REGION, action, version, method = 'POST', query = {}, body }) {
+/** 火山引擎 OpenAPI SigV4 签名请求（通用：支持 GET/POST + 自定义 host/path/service/region/query） */
+export async function signedOpenApiRequest({ ak, sk, service, region = REGION, action, version, method = 'POST', query = {}, body, host = OPEN_HOST, path = '/', rawResponse = false }) {
   const now = new Date();
   const xDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, ''); // YYYYMMDDTHHMMSSZ
   const shortDate = xDate.slice(0, 8);
   const payload = method === 'GET' ? '' : JSON.stringify(body ?? {});
   const payloadHash = sha256hex(payload);
-  const allQuery = { Action: action, Version: version, ...query };
+  const allQuery = { ...(action ? { Action: action, Version: version } : {}), ...query };
   const canonicalQuery = Object.keys(allQuery).sort()
     .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(allQuery[k])}`)
     .join('&');
@@ -43,9 +43,9 @@ export async function signedOpenApiRequest({ ak, sk, service, region = REGION, a
 
   const signedHeaders = 'content-type;host;x-content-sha256;x-date';
   const canonicalRequest = [
-    method, '/', canonicalQuery,
+    method, path, canonicalQuery,
     `content-type:${contentType}`,
-    `host:${OPEN_HOST}`,
+    `host:${host}`,
     `x-content-sha256:${payloadHash}`,
     `x-date:${xDate}`,
     '', signedHeaders, payloadHash,
@@ -56,7 +56,7 @@ export async function signedOpenApiRequest({ ak, sk, service, region = REGION, a
   const kSigning = hmac(hmac(hmac(hmac(sk, shortDate), region), service), 'request');
   const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
 
-  const res = await fetch(`https://${OPEN_HOST}/?${canonicalQuery}`, {
+  const res = await fetch(`https://${host}${path}${canonicalQuery ? '?' + canonicalQuery : ''}`, {
     method,
     headers: {
       'Content-Type': contentType,
@@ -65,15 +65,16 @@ export async function signedOpenApiRequest({ ak, sk, service, region = REGION, a
       Authorization: `HMAC-SHA256 Credential=${ak}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
     },
     body: method === 'GET' ? undefined : payload,
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 30000)),
   });
+  if (rawResponse) return res;
   const json = await res.json().catch(() => ({}));
   return { status: res.status, json };
 }
 
 // ---------------- Ark API Key 管理 ----------------
 let cachedKey = null; // { key, expiresAt }
-let lastKeyError = null;
+let keyErrors = [];
 
 export async function getArkApiKey() {
   if (process.env.ARK_API_KEY) return process.env.ARK_API_KEY;
@@ -83,12 +84,13 @@ export async function getArkApiKey() {
   if (!ak || !sk) throw new Error('缺少 VOLC_AK/VOLC_SK 或 ARK_API_KEY');
 
   const allModels = [...new Set([...TEXT_CANDIDATES, ...VISION_CANDIDATES])];
-  // 不同账号/版本对 ResourceType 的要求不同，逐一尝试
+  // 不同账号/平台版本对参数要求不同，逐一尝试并完整记录错误
   const attempts = [
     { DurationSeconds: 30 * 86400 },
+    { DurationSeconds: 30 * 86400, ResourceType: 'endpoint' },
     { DurationSeconds: 30 * 86400, ResourceType: 'endpoint', ResourceIds: allModels },
-    { DurationSeconds: 7 * 86400, ResourceType: 'model', ResourceIds: allModels },
   ];
+  keyErrors = [];
   for (const body of attempts) {
     try {
       const { status, json } = await signedOpenApiRequest({
@@ -98,37 +100,54 @@ export async function getArkApiKey() {
       if (status === 200 && key) {
         const ttl = (body.DurationSeconds ?? 86400) * 1000;
         cachedKey = { key, expiresAt: Date.now() + ttl };
-        lastKeyError = null;
+        keyErrors = [];
         return key;
       }
-      lastKeyError = `GetApiKey ${status}: ${JSON.stringify(json?.ResponseMetadata?.Error ?? json).slice(0, 300)}`;
+      keyErrors.push(`[${JSON.stringify(Object.keys(body))}] ${status}: ${JSON.stringify(json?.ResponseMetadata?.Error ?? json).slice(0, 220)}`);
     } catch (e) {
-      lastKeyError = `GetApiKey 异常: ${e.message}`;
+      keyErrors.push(`异常: ${e.message}`);
     }
   }
-  throw new Error(lastKeyError ?? 'GetApiKey 失败');
+  throw new Error('GetApiKey 全部失败');
 }
 
 // ---------------- Chat Completions ----------------
+let authMode = null; // 'api-key' | 'signed'
+
 async function chatOnce({ model, messages, tools, temperature = 0.2, maxTokens = 4096, responseFormat }) {
-  const apiKey = await getArkApiKey();
   const body = { model, messages, temperature, max_tokens: maxTokens };
   if (tools) body.tools = tools;
   if (responseFormat) body.response_format = responseFormat;
-  const res = await fetch(`https://${ARK_HOST}/api/v3/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 30000)),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(`Ark ${res.status} [${model}]: ${JSON.stringify(json?.error ?? json).slice(0, 300)}`);
-    err.status = res.status;
-    err.code = json?.error?.code;
-    throw err;
+
+  let res, json;
+  let apiKey = null;
+  if (authMode !== 'signed') {
+    try { apiKey = await getArkApiKey(); } catch { /* 转直签 */ }
   }
-  return json;
+  if (apiKey) {
+    res = await fetch(`https://${ARK_HOST}/api/v3/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Number(process.env.ARK_TIMEOUT_MS || 30000)),
+    });
+    json = await res.json().catch(() => ({}));
+    if (res.ok) { authMode = 'api-key'; return json; }
+  } else {
+    // 兜底：对 /api/v3 直接 SigV4 签名（service=ark）
+    res = await signedOpenApiRequest({
+      ak: process.env.VOLC_AK, sk: process.env.VOLC_SK,
+      service: 'ark', region: 'cn-beijing',
+      host: ARK_HOST, path: '/api/v3/chat/completions',
+      method: 'POST', body, rawResponse: true,
+    });
+    json = await res.json().catch(() => ({}));
+    if (res.ok) { authMode = 'signed'; return json; }
+  }
+  const err = new Error(`Ark ${res.status} [${model}|${apiKey ? 'key' : 'signed'}]: ${JSON.stringify(json?.error ?? json).slice(0, 300)}`);
+  err.status = res.status;
+  err.code = json?.error?.code;
+  throw err;
 }
 
 const resolved = { text: null, vision: null };
@@ -163,12 +182,17 @@ export async function chat({ kind = 'text', ...args }) {
 }
 
 export async function arkStatus() {
-  const out = { auth: 'unknown', textModel: resolved.text, visionModel: resolved.vision, lastKeyError };
+  const out = { auth: 'unknown', authMode, textModel: resolved.text, visionModel: resolved.vision, keyErrors };
   try {
-    await getArkApiKey();
-    out.auth = process.env.ARK_API_KEY ? 'env-api-key' : 'ak/sk minted';
+    try {
+      await getArkApiKey();
+      out.auth = process.env.ARK_API_KEY ? 'env-api-key' : 'ak/sk minted';
+    } catch {
+      out.auth = 'fallback-signed';
+    }
     try { out.textModel = await resolveModel('text', TEXT_CANDIDATES); } catch (e) { out.modelError = e.message; }
     try { out.visionModel = await resolveModel('vision', VISION_CANDIDATES); } catch { /* 已在 modelError 体现 */ }
+    out.authMode = authMode;
   } catch (e) {
     out.auth = 'failed';
     out.authError = e.message;
