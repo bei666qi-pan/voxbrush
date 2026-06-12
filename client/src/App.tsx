@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { applyOps, initialScene, render, sceneBrief } from './engine/scene';
+import { applyOps, initialScene, insertImageNode, render, sceneBrief } from './engine/scene';
 import { CANVAS_H, CANVAS_W, Op, SceneState } from './engine/types';
 import { needsVision, parseLocal } from './voice/parser';
 import { AsrEngine, ServerAsr, WebSpeechAsr } from './voice/asrClient';
@@ -67,7 +67,39 @@ export default function App() {
     setLogs(ls => [...ls.slice(-30), { ...item, id: ++logSeq }]);
 
   // ---------- 执行 Ops ----------
-  const execute = useCallback((ops: Op[], reply?: string) => {
+  const runGenerateImages = useCallback(async (items: NonNullable<ReturnType<typeof applyOps>['effects']['generateImage']>) => {
+    for (const item of items ?? []) {
+      say(item.as === 'background' ? '正在生成背景，请稍等' : '正在生成图片，请稍等');
+      try {
+        const res = await fetch('/api/image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: item.prompt,
+            size: item.as === 'background' ? '1024x576' : '512x512',
+          }),
+          signal: AbortSignal.timeout(90000),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || !json.url) {
+          say('图片生成失败了，我用素材库来画');
+          continue;
+        }
+        insertImageNode(sceneRef.current, json.url, {
+          as: item.as,
+          x: item.x,
+          y: item.y,
+          w: item.w ?? (item.as === 'background' ? CANVAS_W : 200),
+          h: item.h ?? (item.as === 'background' ? CANVAS_H : 150),
+        });
+        setObjCount(sceneRef.current.nodes.length);
+      } catch {
+        say('图片生成超时了，继续用矢量素材');
+      }
+    }
+  }, [say]);
+
+  const execute = useCallback(async (ops: Op[], reply?: string) => {
     const s = sceneRef.current;
     const t0 = performance.now();
     // undo/redo 特殊处理
@@ -88,6 +120,7 @@ export default function App() {
       if (undoStack.current.length > 100) undoStack.current.shift();
       redoStack.current = [];
       const { effects } = applyOps(sceneRef.current, rest);
+      if (effects.generateImage?.length) await runGenerateImages(effects.generateImage);
       if (effects.save) downloadPng();
       if (effects.help) { setShowHelp(true); say('试试这些指令：画一个红色的圆，或者说，画一座房子和一棵树'); }
       const extra = effects.say?.length ? effects.say.join('，') : undefined;
@@ -99,7 +132,7 @@ export default function App() {
     }
     setObjCount(sceneRef.current.nodes.length);
     return Math.round(performance.now() - t0);
-  }, [say]);
+  }, [say, runGenerateImages]);
 
   const downloadPng = () => {
     const c = canvasRef.current; if (!c) return;
@@ -119,7 +152,7 @@ export default function App() {
     const t0 = performance.now();
     const local = parseLocal(trimmed);
     if (local) {
-      const ms = execute(local.ops, local.reply);
+      const ms = await execute(local.ops, local.reply);
       pushLog({ text: trimmed, lane: 'L0 本地', ops: local.ops.length, ms: Math.round(performance.now() - t0) + ms, asrMs });
       return;
     }
@@ -142,23 +175,24 @@ export default function App() {
       if (undoStack.current.length > 100) undoStack.current.shift();
       redoStack.current = [];
     };
-    const applyStreamOp = (op: Op) => {
+    const applyStreamOp = async (op: Op) => {
       const { effects } = applyOps(sceneRef.current, [op]);
+      if (effects.generateImage?.length) await runGenerateImages(effects.generateImage);
       if (effects.save) downloadPng();
       setObjCount(sceneRef.current.nodes.length);
     };
 
     try {
-      await callAgentStream(trimmed, sceneBrief(sceneRef.current), snapshot, ev => {
+      await callAgentStream(trimmed, sceneBrief(sceneRef.current), snapshot, async ev => {
         if (ev.type === 'op' && ev.op) {
           if (!started) { beginBatch(); started = true; firstMs = Math.round(performance.now() - t0); }
-          applyStreamOp(ev.op);
+          await applyStreamOp(ev.op);
           opCount++;
         } else if (ev.type === 'done') {
           const rest = (ev.ops ?? []).slice(ev.emitted ?? opCount);
           if (rest.length) {
             if (!started) { beginBatch(); started = true; }
-            rest.forEach(applyStreamOp);
+            for (const o of rest) await applyStreamOp(o);
             opCount += rest.length;
           }
           if (opCount || ev.reply) say(ev.reply ?? '画好了');
@@ -174,7 +208,7 @@ export default function App() {
     } finally {
       setThinking(false);
     }
-  }, [execute, say]);
+  }, [execute, say, runGenerateImages]);
 
   const handleRef = useRef(handleUtterance);
   handleRef.current = handleUtterance;

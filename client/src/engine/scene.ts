@@ -1,7 +1,27 @@
-import { CANVAS_H, CANVAS_W, Node, Op, SceneState, Target } from './types';
+import { CANVAS_H, CANVAS_W, Gradient, Node, Op, SceneState, Target } from './types';
+import { drawSprite, resolvePalette, SPRITES } from './assets';
 
 let seq = 0;
 const nid = () => `n${++seq}_${Date.now().toString(36)}`;
+
+const imageCache = new Map<string, HTMLImageElement>();
+const imagePending = new Map<string, Promise<HTMLImageElement>>();
+
+export function loadImage(src: string): Promise<HTMLImageElement> {
+  const cached = imageCache.get(src);
+  if (cached?.complete && cached.naturalWidth) return Promise.resolve(cached);
+  const pending = imagePending.get(src);
+  if (pending) return pending;
+  const p = new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => { imageCache.set(src, img); imagePending.delete(src); resolve(img); };
+    img.onerror = () => { imagePending.delete(src); reject(new Error('image load failed')); };
+    img.src = src;
+  });
+  imagePending.set(src, p);
+  return p;
+}
 
 export function initialScene(): SceneState {
   return { nodes: [], background: '#ffffff', selectedId: null, lastId: null };
@@ -15,7 +35,7 @@ const NAMED: Record<string, [number, number, number]> = {
 };
 function hexToRgb(c?: string): [number, number, number] | null {
   if (!c) return null;
-  const m = c.replace('#', '');
+  const m = c.replace('#', '').slice(0, 6);
   if (!/^[0-9a-f]{6}$/i.test(m)) return null;
   return [parseInt(m.slice(0, 2), 16), parseInt(m.slice(2, 4), 16), parseInt(m.slice(4, 6), 16)];
 }
@@ -38,12 +58,14 @@ export function resolveTarget(s: SceneState, t?: Target): Node | null {
   }
   if (tt.kind === 'name') {
     const q = (tt.name ?? '').trim();
-    return [...ns].reverse().find(n => n.name && (n.name === q || n.name.includes(q) || q.includes(n.name))) ?? null;
+    return [...ns].reverse().find(n =>
+      n.name && (n.name === q || n.name.includes(q) || q.includes(n.name)) ||
+      (n.shape === 'sprite' && n.asset && (n.asset === q || SPRITES[n.asset]?.label === q || q.includes(SPRITES[n.asset]?.label ?? ''))),
+    ) ?? null;
   }
-  // query
   let cand = ns.filter(n =>
     (!tt.shape || n.shape === tt.shape) &&
-    (!tt.color || colorMatches(n.fill ?? n.stroke, tt.color)),
+    (!tt.color || colorMatches(n.fill ?? n.stroke ?? n.palette?.[0], tt.color)),
   );
   if (tt.position && cand.length > 1) {
     const score = (n: Node) => ({
@@ -55,7 +77,6 @@ export function resolveTarget(s: SceneState, t?: Target): Node | null {
   return cand[cand.length - 1] ?? null;
 }
 
-// ---------- 默认布局：未指定位置时找空白区 ----------
 function autoPlace(s: SceneState): { x: number; y: number } {
   const cells = [[480, 300], [300, 220], [660, 220], [300, 400], [660, 400], [480, 160], [480, 440], [180, 300], [780, 300]];
   for (const [x, y] of cells) {
@@ -67,9 +88,16 @@ function autoPlace(s: SceneState): { x: number; y: number } {
 const PALETTE = ['#3498db', '#e74c3c', '#2ecc71', '#f1c40f', '#9b59b6', '#e67e22', '#1abc9c'];
 let paletteIdx = 0;
 
-export interface ApplyResult { changed: boolean; effects: { say?: string[]; save?: boolean; help?: boolean }; }
+export interface ApplyResult {
+  changed: boolean;
+  effects: {
+    say?: string[];
+    save?: boolean;
+    help?: boolean;
+    generateImage?: { prompt: string; as: 'background' | 'object'; x?: number; y?: number; w?: number; h?: number }[];
+  };
+}
 
-/** 执行一批 Op（undo/redo 由 store 层处理，这里跳过） */
 export function applyOps(s: SceneState, ops: Op[]): ApplyResult {
   const effects: ApplyResult['effects'] = { say: [] };
   let changed = false;
@@ -90,6 +118,23 @@ export function applyOps(s: SceneState, ops: Op[]): ApplyResult {
         if ((node.shape === 'rect' || node.shape === 'ellipse' || node.shape === 'triangle' || node.shape === 'star' || node.shape === 'heart' || node.shape === 'polygon') && node.w == null) {
           node.w = node.r ? node.r * 2 : 120; node.h = node.h ?? (node.shape === 'ellipse' ? node.w * 0.66 : node.w);
         }
+        if (node.shape === 'sprite' && node.asset) {
+          const def = SPRITES[node.asset];
+          if (def) {
+            node.w = node.w ?? def.defaultW;
+            node.h = node.h ?? def.defaultH;
+            node.palette = resolvePalette(node.asset, node.fill, node.palette);
+            node.name = node.name ?? def.label;
+            if (node.z == null) node.z = 0;
+          }
+        }
+        if (node.shape === 'path' && (node.w == null || node.h == null)) {
+          node.w = node.w ?? 120; node.h = node.h ?? 120;
+        }
+        if (node.shape === 'image') {
+          node.w = node.w ?? 200; node.h = node.h ?? 150;
+          if (node.z == null) node.z = 0;
+        }
         if (node.shape === 'text') {
           node.fontSize = node.fontSize ?? 36;
           node.fill = op.props?.fill ?? '#2d3436';
@@ -106,7 +151,14 @@ export function applyOps(s: SceneState, ops: Op[]): ApplyResult {
       case 'modify': {
         const n = resolveTarget(s, op.target);
         if (!n) { effects.say!.push('没找到要修改的对象'); break; }
-        if (op.set) Object.assign(n, sanitize(op.set));
+        if (op.set) {
+          const set = sanitize(op.set);
+          if (n.shape === 'sprite' && set.fill && n.asset) {
+            n.palette = resolvePalette(n.asset, set.fill as string, n.palette);
+            delete set.fill;
+          }
+          Object.assign(n, set);
+        }
         if (op.delta) {
           if (op.delta.dx) { n.x += op.delta.dx; if (n.x2 != null) n.x2 += op.delta.dx; }
           if (op.delta.dy) { n.y += op.delta.dy; if (n.y2 != null) n.y2 += op.delta.dy; }
@@ -150,10 +202,39 @@ export function applyOps(s: SceneState, ops: Op[]): ApplyResult {
       case 'save': effects.save = true; break;
       case 'say': effects.say!.push(op.text); break;
       case 'help': effects.help = true; break;
-      default: break; // undo/redo 由 store 处理
+      case 'generate_image':
+        effects.generateImage = effects.generateImage ?? [];
+        effects.generateImage.push({
+          prompt: op.prompt, as: op.as,
+          x: op.x, y: op.y, w: op.w, h: op.h,
+        });
+        break;
+      default: break;
     }
   }
   return { changed, effects };
+}
+
+/** Insert an image node after API generation */
+export function insertImageNode(s: SceneState, src: string, opts: { as: 'background' | 'object'; x?: number; y?: number; w?: number; h?: number; name?: string }) {
+  const w = opts.w ?? (opts.as === 'background' ? CANVAS_W : 200);
+  const h = opts.h ?? (opts.as === 'background' ? CANVAS_H : 150);
+  const node: Node = {
+    id: nid(), shape: 'image', src,
+    x: opts.x ?? (opts.as === 'background' ? CANVAS_W / 2 : 480),
+    y: opts.y ?? (opts.as === 'background' ? CANVAS_H / 2 : 300),
+    w, h,
+    z: opts.as === 'background' ? -100 : 0,
+    name: opts.name ?? (opts.as === 'background' ? '背景' : '生成图'),
+    bornAt: performance.now(),
+  };
+  if (opts.as === 'background') {
+    s.nodes = s.nodes.filter(n => !(n.shape === 'image' && n.z != null && n.z <= -100));
+  }
+  s.nodes.push(node);
+  s.lastId = node.id;
+  loadImage(src).catch(() => {});
+  return node;
 }
 
 function sanitize(set: Partial<Node>): Partial<Node> {
@@ -161,10 +242,48 @@ function sanitize(set: Partial<Node>): Partial<Node> {
   delete (out as Record<string, unknown>).id;
   if (out.r != null) out.r = Math.min(600, Math.max(2, out.r));
   if (out.fontSize != null) out.fontSize = Math.min(200, Math.max(8, out.fontSize));
+  if (out.d != null && out.d.length > 4000) out.d = out.d.slice(0, 4000);
+  if (out.src != null && out.src.length > 8000) delete out.src;
   return out;
 }
 
-// ---------- 渲染 ----------
+function sortedNodes(nodes: Node[]): Node[] {
+  return [...nodes].sort((a, b) => {
+    const za = a.z ?? 0, zb = b.z ?? 0;
+    if (za !== zb) return za - zb;
+    return 0;
+  });
+}
+
+function applyShadow(ctx: CanvasRenderingContext2D, shadow?: Node['shadow']) {
+  if (!shadow) return;
+  ctx.shadowBlur = shadow.blur;
+  ctx.shadowColor = shadow.color;
+  ctx.shadowOffsetX = shadow.dx ?? 0;
+  ctx.shadowOffsetY = shadow.dy ?? 0;
+}
+
+function clearShadow(ctx: CanvasRenderingContext2D) {
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 0;
+}
+
+function buildGradient(ctx: CanvasRenderingContext2D, g: Gradient, w: number, h: number): CanvasGradient {
+  if (g.type === 'radial') {
+    const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, Math.max(w, h) / 2);
+    g.stops.forEach(([o, c]) => grad.addColorStop(Math.min(1, Math.max(0, o)), c));
+    return grad;
+  }
+  const angle = ((g.angle ?? 180) * Math.PI) / 180;
+  const len = Math.max(w, h) / 2;
+  const x0 = -Math.cos(angle) * len, y0 = -Math.sin(angle) * len;
+  const x1 = Math.cos(angle) * len, y1 = Math.sin(angle) * len;
+  const grad = ctx.createLinearGradient(x0, y0, x1, y1);
+  g.stops.forEach(([o, c]) => grad.addColorStop(Math.min(1, Math.max(0, o)), c));
+  return grad;
+}
+
 export function render(ctx: CanvasRenderingContext2D, s: SceneState, dpr: number) {
   const now = performance.now();
   ctx.save();
@@ -172,7 +291,7 @@ export function render(ctx: CanvasRenderingContext2D, s: SceneState, dpr: number
   ctx.fillStyle = s.background;
   ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
-  for (const n of s.nodes) {
+  for (const n of sortedNodes(s.nodes)) {
     ctx.save();
     const k = n.bornAt ? Math.min(1, (now - n.bornAt) / 220) : 1;
     const ease = 1 - (1 - k) * (1 - k);
@@ -180,7 +299,9 @@ export function render(ctx: CanvasRenderingContext2D, s: SceneState, dpr: number
     if (n.rotation) ctx.rotate((n.rotation * Math.PI) / 180);
     ctx.scale(ease, ease);
     ctx.globalAlpha = (n.opacity ?? 1) * (0.4 + 0.6 * ease);
+    applyShadow(ctx, n.shadow);
     drawShape(ctx, n);
+    clearShadow(ctx);
     ctx.restore();
 
     if (n.id === s.selectedId) {
@@ -197,11 +318,47 @@ export function render(ctx: CanvasRenderingContext2D, s: SceneState, dpr: number
 }
 
 function drawShape(ctx: CanvasRenderingContext2D, n: Node) {
-  ctx.fillStyle = n.fill ?? 'transparent';
+  const w = n.w ?? 120, h = n.h ?? 120;
+
+  if (n.shape === 'sprite' && n.asset) {
+    const palette = resolvePalette(n.asset, n.fill, n.palette);
+    drawSprite(ctx, n.asset, w, h, palette);
+    return;
+  }
+
+  if (n.shape === 'image' && n.src) {
+    const img = imageCache.get(n.src);
+    if (img?.complete && img.naturalWidth) {
+      ctx.drawImage(img, -w / 2, -h / 2, w, h);
+    } else {
+      loadImage(n.src).catch(() => {});
+      ctx.fillStyle = '#dfe6e9';
+      ctx.fillRect(-w / 2, -h / 2, w, h);
+    }
+    return;
+  }
+
+  if (n.shape === 'path' && n.d) {
+    const scaleX = w / 200, scaleY = h / 200;
+    ctx.save();
+    ctx.scale(scaleX, scaleY);
+    const path = new Path2D(n.d);
+    if (n.gradient) ctx.fillStyle = buildGradient(ctx, n.gradient, 200, 200);
+    else ctx.fillStyle = n.fill ?? 'transparent';
+    ctx.fill(path);
+    if (n.stroke && n.strokeWidth) {
+      ctx.strokeStyle = n.stroke;
+      ctx.lineWidth = (n.strokeWidth ?? 1) / Math.min(scaleX, scaleY);
+      ctx.stroke(path);
+    }
+    ctx.restore();
+    return;
+  }
+
+  ctx.fillStyle = n.gradient ? buildGradient(ctx, n.gradient, w, h) : (n.fill ?? 'transparent');
   ctx.strokeStyle = n.stroke ?? 'transparent';
   ctx.lineWidth = n.strokeWidth ?? 0;
   ctx.lineCap = 'round';
-  const w = n.w ?? 120, h = n.h ?? 120;
   const path = new Path2D();
   switch (n.shape) {
     case 'circle': path.arc(0, 0, n.r ?? 60, 0, Math.PI * 2); break;
@@ -242,7 +399,7 @@ function drawShape(ctx: CanvasRenderingContext2D, n: Node) {
       return;
     }
   }
-  if (n.fill) ctx.fill(path);
+  if (n.fill || n.gradient) ctx.fill(path);
   if (n.stroke && n.strokeWidth) ctx.stroke(path);
 }
 
@@ -278,14 +435,15 @@ export function bbox(n: Node): { x: number; y: number; w: number; h: number } {
     const fs = n.fontSize ?? 36, tw = (n.text?.length ?? 2) * fs;
     return { x: n.x - tw / 2, y: n.y - fs / 2, w: tw, h: fs };
   }
-  const w = n.w ?? 120, h = n.h ?? 120;
+  const w = n.w ?? (n.shape === 'sprite' && n.asset ? SPRITES[n.asset]?.defaultW ?? 120 : 120);
+  const h = n.h ?? (n.shape === 'sprite' && n.asset ? SPRITES[n.asset]?.defaultH ?? 120 : 120);
   return { x: n.x - w / 2, y: n.y - h / 2, w, h };
 }
 
-/** 给 LLM 的场景摘要 */
 export function sceneBrief(s: SceneState) {
   return s.nodes.map(n => ({
     id: n.id, name: n.name, shape: n.shape, fill: n.fill,
+    asset: n.asset, z: n.z,
     x: Math.round(n.x), y: Math.round(n.y),
     w: n.w && Math.round(n.w), h: n.h && Math.round(n.h), r: n.r && Math.round(n.r),
     text: n.text,

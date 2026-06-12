@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { initAsr, asrStatus, attachAsrSocket } from './asr.js';
 import { understand, understandStream } from './agent.js';
-import { arkStatus } from './volc.js';
+import { arkStatus, generateImage, initImageModel } from './volc.js';
 import { ensureDns, dnsStatus } from './dns.js';
 
 const PORT = Number(process.env.PORT || 8080);
@@ -53,11 +53,24 @@ app.post('/api/agent/stream', async (req, res) => {
   res.end();
 });
 
+/** Seedream 文生图（可选增强，失败不影响核心链路） */
+app.post('/api/image', async (req, res) => {
+  const { prompt, size } = req.body ?? {};
+  if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt 必填' });
+  try {
+    const result = await generateImage({ prompt: prompt.slice(0, 500), size: size ?? '1024x576' });
+    res.json(result);
+  } catch (e) {
+    console.error('[image]', e.message);
+    res.status(502).json({ error: e.message, degraded: true });
+  }
+});
+
 app.get('/api/health', async (_req, res) => {
   const ark = await arkStatus().catch(e => ({ auth: 'failed', authError: e.message }));
   res.json({
     name: 'voxbrush',
-    version: process.env.APP_VERSION || '1.0.0',
+    version: process.env.APP_VERSION || '1.2.0',
     time: new Date().toISOString(),
     asr: asrStatus(),
     ark,
@@ -78,5 +91,6 @@ const wss = new WebSocketServer({ server, path: '/ws/asr' });
 wss.on('connection', ws => attachAsrSocket(ws));
 
 initAsr();
+initImageModel().catch(e => console.warn('[image init]', e.message));
 ensureDns().catch(e => console.error('[dns]', e.message));
 server.listen(PORT, () => console.log(`[voxbrush] http://0.0.0.0:${PORT}`));

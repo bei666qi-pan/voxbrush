@@ -4,6 +4,7 @@
  * 设计原则：宽进严出 —— 词法层大量容错（同音字/口语词/数词），语义层只在有把握时产出。
  */
 import { CANVAS_H, CANVAS_W, Op, Shape, Target } from '../engine/types';
+import { SPRITES } from '../engine/assets';
 import { normalizeNumbers, zhToNum } from './zhNumbers';
 
 // ---------- 词法容错（同音字 / 口语词归一） ----------
@@ -63,7 +64,36 @@ const SHAPE_WORDS: [string, Shape, Partial<{ sides: number }>][] = [
   ['箭头', 'arrow', {}],
   ['横线|竖线|斜线|直线|线条|线段|线', 'line', {}],
 ];
+
+/** 语义素材库名词 → asset id */
+const SPRITE_WORDS: [string, string][] = [
+  ['房子|小屋|房屋|房', 'house'],
+  ['(?:小|大)?树(?!屋)|(?:小|大)?树木', 'tree'],
+  ['松树|圣诞树', 'pine'],
+  ['(?:远|大|小)?山|山峰|山脉', 'mountain'],
+  ['(?:白)?云(?:朵)?|云彩', 'cloud'],
+  ['太阳|日', 'sun'],
+  ['月亮|月', 'moon'],
+  ['(?:小|大)?花(?:朵)?', 'flower'],
+  ['草(?:丛|地)?|小草', 'grass'],
+  ['小人|人(?:物)?|小孩|男孩|女孩', 'person'],
+  ['鸟(?:儿)?|小鸟', 'bird'],
+  ['鱼(?:儿)?|小鱼', 'fish'],
+  ['船(?:只)?|小舟|小船', 'boat'],
+  ['(?:汽)?车|小车|汽车', 'car'],
+  ['彩虹', 'rainbow'],
+  ['雪人', 'snowman'],
+  ['气球', 'balloon'],
+];
+const SPRITE_ALT = SPRITE_WORDS.map(w => w[0]).join('|');
 const SHAPE_ALT = SHAPE_WORDS.map(w => w[0]).join('|');
+
+function spriteOf(word: string): string | null {
+  for (const [src, asset] of SPRITE_WORDS) {
+    if (new RegExp(`^(${src})$`).test(word)) return asset;
+  }
+  return null;
+}
 function shapeOf(word: string): [Shape, Partial<{ sides: number }>] | null {
   for (const [src, shape, extra] of SHAPE_WORDS) {
     if (new RegExp(`^(${src})$`).test(word)) return [shape, extra];
@@ -129,7 +159,7 @@ function extractTarget(seg: string): { target: Target; rest: string } {
     if (q.groups.pos) target.position = POSITIONS[q.groups.pos]?.pos;
     return { target, rest: seg.slice(q[0].length) };
   }
-  // 名字引用："把太阳改成红色"
+  // 名字引用："把太阳改成红色" / "把房子改成蓝色"
   const nm = seg.match(/^(?:把|让|将)([^改变换大小往向移转删旋缩放的]{1,8}?)的?(?=改|变|换|大|小|往|向|移|转|旋|删|缩|放)/);
   if (nm) return { target: { kind: 'name', name: nm[1] }, rest: seg.slice(nm[0].length) };
 
@@ -277,43 +307,59 @@ function parseDraw(s: string): Op[] | null {
   if (!/画|加|放/.test(str)) str = '画' + str;
 
   const m = str.match(new RegExp(
-    `(?:画|加|放)\\s*(?<count>\\d+)?(?:个|条|根|颗|朵|只|枚|道|座)?` +
+    `(?:画|加|放)\\s*(?<count>\\d+)?(?:个|条|根|颗|朵|只|枚|道|座|棵|辆|艘|条)?` +
     `(?<size1>${SIZE_RE})?的?` +
     `(?:(?<mod>深|浅|淡)?(?<base>${COLOR_BASE})色?的?)?` +
     `(?<size2>${SIZE_RE})?的?` +
-    `(?<shape>${SHAPE_ALT})`,
+    `(?<thing>${SPRITE_ALT}|${SHAPE_ALT})`,
   ));
-  if (!m?.groups?.shape) return null;
+  if (!m?.groups?.thing) return null;
   const g = m.groups;
 
   const count = Math.min(g.count ? parseInt(g.count) : 1, 12);
-  const found = shapeOf(g.shape);
-  if (!found) return null;
-  const [shape, extra] = found;
+  const asset = spriteOf(g.thing);
+  const found = asset ? null : shapeOf(g.thing);
+  if (!asset && !found) return null;
+
   const k = (g.size1 ?? g.size2) ? SIZES[(g.size1 ?? g.size2)!] ?? 1 : 1;
   const fill = g.base ? colorHex(g.mod, g.base) : undefined;
 
   const ops: Op[] = [];
   for (let i = 0; i < count; i++) {
-    const props: Partial<Record<string, unknown>> & { w?: number; h?: number } = { fill, ...extra };
+    const props: Partial<Record<string, unknown>> = { fill };
     if (x != null) props.x = x + (count > 1 ? (i - (count - 1) / 2) * 150 * k : 0);
     if (y != null) props.y = y;
-    if (shape === 'circle') props.r = (r ?? 60) * k;
-    else if (shape === 'line' || shape === 'arrow') {
-      const len = (w ?? 160) * k;
-      if (/竖线/.test(g.shape)) { props.w = 0; props.h = len; }
-      else if (/斜线/.test(g.shape)) { props.w = len * 0.7; props.h = len * 0.7; }
-      else { props.w = len; props.h = 0; }
-      if (fill) { props.stroke = fill; props.fill = undefined; }
+
+    if (asset) {
+      const def = SPRITES[asset];
+      props.asset = asset;
+      props.name = def?.label ?? asset;
+      props.w = (def?.defaultW ?? 120) * k;
+      props.h = (def?.defaultH ?? 120) * k;
+      if (/云|太阳|月亮|彩虹|鸟/.test(g.thing)) props.z = 10;
+      if (/山|树|松树|房子|草/.test(g.thing)) props.z = 0;
+      ops.push({ op: 'add', shape: 'sprite', props } as Op);
     } else {
-      const base = w ?? (r ? r * 2 : 120);
-      props.w = base * k;
-      props.h = (h ?? (shape === 'ellipse' ? base * 0.66 : base)) * k;
+      const [shape, extra] = found!;
+      Object.assign(props, extra);
+      if (shape === 'circle') props.r = (r ?? 60) * k;
+      else if (shape === 'line' || shape === 'arrow') {
+        const len = (w ?? 160) * k;
+        if (/竖线/.test(g.thing)) { props.w = 0; props.h = len; }
+        else if (/斜线/.test(g.thing)) { props.w = len * 0.7; props.h = len * 0.7; }
+        else { props.w = len; props.h = 0; }
+        if (fill) { props.stroke = fill; props.fill = undefined; }
+      } else {
+        const base = w ?? (r ? r * 2 : 120);
+        props.w = base * k;
+        props.h = (h ?? (shape === 'ellipse' ? base * 0.66 : base)) * k;
+      }
+      ops.push({ op: 'add', shape, props } as Op);
     }
-    ops.push({ op: 'add', shape, props } as Op);
   }
+  const label = asset ? (SPRITES[asset]?.label ?? g.thing) : g.thing;
   const colorName = g.base ? `${g.mod ?? ''}${g.base}色` : '';
-  ops.push({ op: 'say', text: `好的，${count > 1 ? count + '个' : ''}${colorName}${g.shape}画好了` });
+  ops.push({ op: 'say', text: `好的，${count > 1 ? count + '个' : ''}${colorName}${label}画好了` });
   return ops;
 }
 

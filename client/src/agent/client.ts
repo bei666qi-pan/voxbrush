@@ -10,7 +10,7 @@ export interface StreamEvent {
 /** v1.1 流式拆解：每解析出一个完整 op 立即回调，实现逐笔绘制 */
 export async function callAgentStream(
   text: string, scene: unknown[], snapshot: string | undefined,
-  onEvent: (ev: StreamEvent) => void,
+  onEvent: (ev: StreamEvent) => void | Promise<void>,
 ): Promise<void> {
   const res = await fetch('/api/agent/stream', {
     method: 'POST',
@@ -34,7 +34,7 @@ export async function callAgentStream(
     for (const p of parts) {
       const m = p.match(/^data:\s*(.*)$/s);
       if (!m) continue;
-      try { onEvent(JSON.parse(m[1]) as StreamEvent); } catch { /* ignore */ }
+      try { const r = onEvent(JSON.parse(m[1]) as StreamEvent); if (r && typeof (r as Promise<void>).then === 'function') await r; } catch { /* ignore */ }
     }
   }
 }
