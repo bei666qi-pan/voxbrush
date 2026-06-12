@@ -13,6 +13,7 @@ import { WebSocketServer } from 'ws';
 import { initAsr, asrStatus, attachAsrSocket } from './asr.js';
 import { understand } from './agent.js';
 import { arkStatus } from './volc.js';
+import { ensureDns, dnsStatus } from './dns.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const app = express();
@@ -40,6 +41,7 @@ app.get('/api/health', async (_req, res) => {
     time: new Date().toISOString(),
     asr: asrStatus(),
     ark,
+    dns: dnsStatus(),
   });
 });
 
@@ -56,4 +58,5 @@ const wss = new WebSocketServer({ server, path: '/ws/asr' });
 wss.on('connection', ws => attachAsrSocket(ws));
 
 initAsr();
+ensureDns().catch(e => console.error('[dns]', e.message));
 server.listen(PORT, () => console.log(`[voxbrush] http://0.0.0.0:${PORT}`));

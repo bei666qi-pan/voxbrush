@@ -28,19 +28,22 @@ const VISION_CANDIDATES = (process.env.ARK_VISION_MODEL ? [process.env.ARK_VISIO
 function hmac(key, data) { return crypto.createHmac('sha256', key).update(data, 'utf8').digest(); }
 function sha256hex(data) { return crypto.createHash('sha256').update(data, 'utf8').digest('hex'); }
 
-/** 火山引擎 OpenAPI SigV4 签名请求 */
-async function signedOpenApiRequest({ ak, sk, service, action, version, body }) {
+/** 火山引擎 OpenAPI SigV4 签名请求（通用：支持 GET/POST + 自定义 service/region/query） */
+export async function signedOpenApiRequest({ ak, sk, service, region = REGION, action, version, method = 'POST', query = {}, body }) {
   const now = new Date();
   const xDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, ''); // YYYYMMDDTHHMMSSZ
   const shortDate = xDate.slice(0, 8);
-  const payload = JSON.stringify(body ?? {});
+  const payload = method === 'GET' ? '' : JSON.stringify(body ?? {});
   const payloadHash = sha256hex(payload);
-  const query = `Action=${action}&Version=${version}`;
+  const allQuery = { Action: action, Version: version, ...query };
+  const canonicalQuery = Object.keys(allQuery).sort()
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(allQuery[k])}`)
+    .join('&');
   const contentType = 'application/json';
 
   const signedHeaders = 'content-type;host;x-content-sha256;x-date';
   const canonicalRequest = [
-    'POST', '/', query,
+    method, '/', canonicalQuery,
     `content-type:${contentType}`,
     `host:${OPEN_HOST}`,
     `x-content-sha256:${payloadHash}`,
@@ -48,20 +51,20 @@ async function signedOpenApiRequest({ ak, sk, service, action, version, body }) 
     '', signedHeaders, payloadHash,
   ].join('\n');
 
-  const scope = `${shortDate}/${REGION}/${service}/request`;
+  const scope = `${shortDate}/${region}/${service}/request`;
   const stringToSign = ['HMAC-SHA256', xDate, scope, sha256hex(canonicalRequest)].join('\n');
-  const kSigning = hmac(hmac(hmac(hmac(sk, shortDate), REGION), service), 'request');
+  const kSigning = hmac(hmac(hmac(hmac(sk, shortDate), region), service), 'request');
   const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
 
-  const res = await fetch(`https://${OPEN_HOST}/?${query}`, {
-    method: 'POST',
+  const res = await fetch(`https://${OPEN_HOST}/?${canonicalQuery}`, {
+    method,
     headers: {
       'Content-Type': contentType,
       'X-Date': xDate,
       'X-Content-Sha256': payloadHash,
       Authorization: `HMAC-SHA256 Credential=${ak}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
     },
-    body: payload,
+    body: method === 'GET' ? undefined : payload,
     signal: AbortSignal.timeout(10000),
   });
   const json = await res.json().catch(() => ({}));
