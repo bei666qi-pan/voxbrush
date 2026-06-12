@@ -34,11 +34,16 @@ const cases: [string, boolean][] = [
   ['保存图片', true],
   ['背景换成深蓝色', true],
   ['帮助', true],
+  ['画一棵树', true],
+  ['在左下角画一座房子', true],
+  ['画三棵小树', true],
+  ['画一个太阳', true],
+  ['画一朵花', true],
   ['画一个圆，然后改成红色，再大一点', true],
   // 同音容错
   ['华一个园形', true],
   ['搞一个紫色的三角形', true],
-  // 应升级 LLM
+  // 应升级 LLM（复合场景仍走 L1）
   ['画一座房子，旁边有一棵树，天上有太阳和云', false],
   ['把整幅画变得更有秋天的感觉', false],
   ['在圆和方块之间画一条连接线', false],
@@ -69,6 +74,15 @@ console.assert(r2.ops.filter(o => o.op === 'add').length === 3, '数量词未生
 const r3 = parseLocal('把红色的圆改成黄色')!;
 const mod = r3.ops.find(o => o.op === 'modify') as { target: { kind: string; color?: string } };
 console.assert(mod.target.kind === 'query' && mod.target.color === 'red', '目标查询解析错误', mod.target);
+
+const r4 = parseLocal('在左下角画一座房子')!;
+const house = r4.ops.find(o => o.op === 'add') as { shape: string; props: { asset?: string; x?: number; y?: number } };
+console.assert(house.shape === 'sprite' && house.props.asset === 'house', '素材解析错误', house);
+console.assert(house.props.x === 190 && house.props.y === 470, '素材位置错误', house.props);
+
+const r5 = parseLocal('画三棵小树')!;
+console.assert(r5.ops.filter(o => o.op === 'add').length === 3, '树数量词未生效');
+console.assert((r5.ops[0] as { props: { asset?: string } }).props.asset === 'tree', '树素材错误');
 
 console.log(`\n${pass}/${pass + fail} 通过`);
 process.exit(fail ? 1 : 0);

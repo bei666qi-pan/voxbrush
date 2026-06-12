@@ -24,6 +24,12 @@ const VISION_CANDIDATES = (process.env.ARK_VISION_MODEL ? [process.env.ARK_VISIO
   'doubao-seed-1-6-250615',
   'doubao-1-5-vision-pro-32k-250115',
 ]);
+const IMAGE_CANDIDATES = (process.env.ARK_IMAGE_MODEL ? [process.env.ARK_IMAGE_MODEL] : []).concat([
+  'doubao-seedream-4-0-250415',
+  'doubao-seedream-4-0',
+  'doubao-seedream-3-0-t2i-250415',
+  'doubao-seedream-3-0-t2i',
+]);
 
 function hmac(key, data) { return crypto.createHmac('sha256', key).update(data, 'utf8').digest(); }
 function sha256hex(data) { return crypto.createHash('sha256').update(data, 'utf8').digest('hex'); }
@@ -76,6 +82,9 @@ export async function signedOpenApiRequest({ ak, sk, service, region = REGION, a
 let cachedKey = null; // { key, expiresAt }
 let keyErrors = [];
 let epList = null; // [{ id, name, model, status }]
+let imageEp = null; // { id, model, version }
+let imageModelResolved = null;
+let imageModelError = null;
 
 async function arkAdmin(ak, sk, action, body) {
   const { status, json } = await signedOpenApiRequest({
@@ -130,6 +139,105 @@ async function discoverEndpoints(ak, sk) {
   }
   console.log(`[volc] 可用接入点: ${epList.map(e => `${e.id}(${e.model})`).join(', ') || '无'}`);
   return epList;
+}
+
+async function discoverImageEndpoint(ak, sk) {
+  if (imageEp) return imageEp;
+  const seedream = (epList ?? []).find(e => /seedream/i.test(e.model));
+  if (seedream) {
+    imageEp = { id: seedream.id, model: seedream.model, version: seedream.version };
+    return imageEp;
+  }
+  for (const [name, ver] of [
+    ['doubao-seedream-4-0', '250415'],
+    ['doubao-seedream-4-0', ''],
+    ['doubao-seedream-3-0-t2i', '250415'],
+    ['doubao-seedream-3-0-t2i', ''],
+  ]) {
+    try {
+      const body = {
+        Name: `voxbrush-img-${name}`.slice(0, 50),
+        ModelReference: { FoundationModel: { Name: name, ...(ver ? { ModelVersion: ver } : {}) } },
+      };
+      const res = await arkAdmin(ak, sk, 'CreateEndpoint', body);
+      if (res?.Id) {
+        imageEp = { id: res.Id, model: name, version: ver };
+        epList = [...(epList ?? []), { id: res.Id, name: body.Name, model: name, version: ver }];
+        console.log(`[volc] 已自建图像接入点 ${res.Id} (${name}${ver ? '@' + ver : ''})`);
+        return imageEp;
+      }
+    } catch (e) {
+      imageModelError = e.message;
+      keyErrors.push(e.message);
+    }
+  }
+  return null;
+}
+
+async function resolveImageModel() {
+  if (imageModelResolved) return imageModelResolved;
+  const ak = process.env.VOLC_AK, sk = process.env.VOLC_SK;
+  if (!process.env.ARK_API_KEY && (!ak || !sk)) {
+    imageModelError = '缺少凭证';
+    throw new Error(imageModelError);
+  }
+  try {
+    if (ak && sk) await discoverEndpoints(ak, sk);
+    const ep = ak && sk ? await discoverImageEndpoint(ak, sk) : null;
+    if (ep?.id) {
+      imageModelResolved = ep.id;
+      imageModelError = null;
+      return imageModelResolved;
+    }
+    // 无自建端点时尝试配置的模型名（需账户已开通）
+    if (IMAGE_CANDIDATES[0]) {
+      imageModelResolved = IMAGE_CANDIDATES[0];
+      return imageModelResolved;
+    }
+    throw new Error(imageModelError ?? '无可用图像接入点');
+  } catch (e) {
+    imageModelError = e.message;
+    throw e;
+  }
+}
+
+export function imageModelAvailable() {
+  return !!imageModelResolved || !!imageEp;
+}
+
+export async function initImageModel() {
+  try {
+    await resolveImageModel();
+    console.log(`[volc] 图像模型就绪: ${imageModelResolved}`);
+  } catch (e) {
+    console.warn(`[volc] 图像模型不可用（优雅降级）: ${e.message}`);
+  }
+}
+
+export async function generateImage({ prompt, size = '1024x576' }) {
+  const model = await resolveImageModel();
+  const apiKey = await getArkApiKey();
+  const res = await fetch(`https://${ARK_HOST}/api/v3/images/generations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      prompt: String(prompt).slice(0, 500),
+      size,
+      response_format: 'url',
+      n: 1,
+    }),
+    signal: AbortSignal.timeout(Number(process.env.ARK_IMAGE_TIMEOUT_MS || 90000)),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(json?.error?.message ?? `Image API ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  const url = json?.data?.[0]?.url;
+  if (!url) throw new Error('图像生成返回为空');
+  return { url, model };
 }
 
 export async function getArkApiKey() {
@@ -299,7 +407,7 @@ export async function chat({ kind = 'text', ...args }) {
 }
 
 export async function arkStatus() {
-  const out = { auth: 'unknown', authMode, textModel: resolved.text, visionModel: resolved.vision };
+  const out = { auth: 'unknown', authMode, textModel: resolved.text, visionModel: resolved.vision, imageModel: null };
   try {
     try {
       await getArkApiKey();
@@ -310,7 +418,14 @@ export async function arkStatus() {
     out.keyErrors = keyErrors;
     out.endpoints = knownEndpoints();
     try { out.textModel = await resolveModel('text', TEXT_CANDIDATES); } catch (e) { out.modelError = e.message; }
-    try { out.visionModel = await resolveModel('vision', VISION_CANDIDATES); } catch { /* 已在 modelError 体现 */ }
+    try { out.visionModel = await resolveModel('vision', VISION_CANDIDATES); } catch { /* noop */ }
+    try {
+      out.imageModel = await resolveImageModel();
+      out.imageAvailable = true;
+    } catch (e) {
+      out.imageAvailable = false;
+      out.imageModelError = imageModelError ?? e.message;
+    }
     out.authMode = authMode;
   } catch (e) {
     out.auth = 'failed';
