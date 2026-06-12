@@ -72,9 +72,65 @@ export async function signedOpenApiRequest({ ak, sk, service, region = REGION, a
   return { status: res.status, json };
 }
 
-// ---------------- Ark API Key 管理 ----------------
+// ---------------- 推理接入点（Endpoint）自举 + Ark API Key 管理 ----------------
 let cachedKey = null; // { key, expiresAt }
 let keyErrors = [];
+let epList = null; // [{ id, name, model, status }]
+
+async function arkAdmin(ak, sk, action, body) {
+  const { status, json } = await signedOpenApiRequest({
+    ak, sk, service: 'ark', action, version: '2024-01-01', body,
+  });
+  const err = json?.ResponseMetadata?.Error;
+  if (status !== 200 || err) {
+    throw new Error(`${action} ${status}: ${JSON.stringify(err ?? json).slice(0, 220)}`);
+  }
+  return json.Result ?? json;
+}
+
+async function discoverEndpoints(ak, sk) {
+  if (epList) return epList;
+  try {
+    const res = await arkAdmin(ak, sk, 'ListEndpoints', { PageNumber: 1, PageSize: 100 });
+    const items = res?.Items ?? [];
+    epList = items
+      .filter(it => !it.Status || /running|enable/i.test(String(it.Status)))
+      .map(it => ({
+        id: it.Id,
+        name: it.Name,
+        model: it?.ModelReference?.FoundationModel?.Name ?? '',
+        version: it?.ModelReference?.FoundationModel?.ModelVersion ?? '',
+      }));
+  } catch (e) {
+    keyErrors.push(e.message);
+    epList = [];
+  }
+  if (!epList.length) {
+    // 没有现成接入点 → 自建一个（多模态 flash 优先）
+    for (const [name, ver] of [
+      ['doubao-seed-1-6-flash', '250828'],
+      ['doubao-seed-1-6-flash', '250615'],
+      ['doubao-seed-1-6', '250615'],
+      ['doubao-1-5-lite-32k', '250115'],
+    ]) {
+      try {
+        const res = await arkAdmin(ak, sk, 'CreateEndpoint', {
+          Name: `voxbrush-${name}-${ver}`.slice(0, 50),
+          ModelReference: { FoundationModel: { Name: name, ModelVersion: ver } },
+        });
+        if (res?.Id) {
+          epList = [{ id: res.Id, name: `voxbrush-${name}`, model: name, version: ver }];
+          console.log(`[volc] 已自建推理接入点 ${res.Id} (${name}@${ver})`);
+          break;
+        }
+      } catch (e) {
+        keyErrors.push(e.message);
+      }
+    }
+  }
+  console.log(`[volc] 可用接入点: ${epList.map(e => `${e.id}(${e.model})`).join(', ') || '无'}`);
+  return epList;
+}
 
 export async function getArkApiKey() {
   if (process.env.ARK_API_KEY) return process.env.ARK_API_KEY;
@@ -83,33 +139,28 @@ export async function getArkApiKey() {
   const ak = process.env.VOLC_AK, sk = process.env.VOLC_SK;
   if (!ak || !sk) throw new Error('缺少 VOLC_AK/VOLC_SK 或 ARK_API_KEY');
 
-  const allModels = [...new Set([...TEXT_CANDIDATES, ...VISION_CANDIDATES])];
-  // 不同账号/平台版本对参数要求不同，逐一尝试并完整记录错误
-  const attempts = [
-    { DurationSeconds: 30 * 86400 },
-    { DurationSeconds: 30 * 86400, ResourceType: 'endpoint' },
-    { DurationSeconds: 30 * 86400, ResourceType: 'endpoint', ResourceIds: allModels },
-  ];
   keyErrors = [];
-  for (const body of attempts) {
-    try {
-      const { status, json } = await signedOpenApiRequest({
-        ak, sk, service: 'ark', action: 'GetApiKey', version: '2024-01-01', body,
-      });
-      const key = json?.Result?.ApiKey;
-      if (status === 200 && key) {
-        const ttl = (body.DurationSeconds ?? 86400) * 1000;
-        cachedKey = { key, expiresAt: Date.now() + ttl };
-        keyErrors = [];
-        return key;
-      }
-      keyErrors.push(`[${JSON.stringify(Object.keys(body))}] ${status}: ${JSON.stringify(json?.ResponseMetadata?.Error ?? json).slice(0, 220)}`);
-    } catch (e) {
-      keyErrors.push(`异常: ${e.message}`);
+  const eps = await discoverEndpoints(ak, sk);
+  if (!eps.length) throw new Error('无可用推理接入点');
+  try {
+    const res = await arkAdmin(ak, sk, 'GetApiKey', {
+      DurationSeconds: 30 * 86400,
+      ResourceType: 'endpoint',
+      ResourceIds: eps.map(e => e.id),
+    });
+    if (res?.ApiKey) {
+      cachedKey = { key: res.ApiKey, expiresAt: Date.now() + 30 * 86400 * 1000 };
+      return res.ApiKey;
     }
+    throw new Error('GetApiKey 返回为空');
+  } catch (e) {
+    keyErrors.push(e.message);
+    throw e;
   }
-  throw new Error('GetApiKey 全部失败');
 }
+
+/** 暴露端点列表供模型解析使用 */
+export function knownEndpoints() { return epList ?? []; }
 
 // ---------------- Chat Completions ----------------
 let authMode = null; // 'api-key' | 'signed'
@@ -154,8 +205,15 @@ const resolved = { text: null, vision: null };
 
 async function resolveModel(kind, candidates) {
   if (resolved[kind]) return resolved[kind];
+  // 接入点 ID 优先（铸造的临时 Key 仅对接入点生效）
+  const eps = knownEndpoints();
+  const epIds = (kind === 'vision'
+    ? [...eps.filter(e => /seed-1-6|vision|omni/.test(e.model)), ...eps]
+    : eps
+  ).map(e => e.id);
+  const all = [...new Set([...epIds, ...candidates])];
   let lastErr = null;
-  for (const m of candidates) {
+  for (const m of all) {
     try {
       await chatOnce({ model: m, messages: [{ role: 'user', content: 'ping，回复 pong' }], maxTokens: 8 });
       resolved[kind] = m;
@@ -163,8 +221,6 @@ async function resolveModel(kind, candidates) {
       return m;
     } catch (e) {
       lastErr = e;
-      // 鉴权类错误无需继续换模型
-      if (e.status === 401 || e.status === 403) throw e;
     }
   }
   throw lastErr ?? new Error('无可用模型');
@@ -191,6 +247,7 @@ export async function arkStatus() {
       out.auth = 'fallback-signed';
     }
     out.keyErrors = keyErrors;
+    out.endpoints = knownEndpoints();
     try { out.textModel = await resolveModel('text', TEXT_CANDIDATES); } catch (e) { out.modelError = e.message; }
     try { out.visionModel = await resolveModel('vision', VISION_CANDIDATES); } catch { /* 已在 modelError 体现 */ }
     out.authMode = authMode;
