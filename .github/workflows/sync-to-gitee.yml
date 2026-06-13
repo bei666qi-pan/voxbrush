@@ -1,0 +1,27 @@
+# GitHub → Gitee 自动镜像同步
+# 触发：push 到 main 时，自动把 main 镜像推送到 Gitee 的 master 分支。
+# 前置：在 GitHub 仓库 Settings → Secrets and variables → Actions 添加：
+#   GITEE_USER  = 你的 Gitee 用户名（如 bei-qi-luo）
+#   GITEE_TOKEN = 你的 Gitee 私人令牌
+# 这样即可实现「代码只推 GitHub，GitHub 自动同步到 Gitee（Coolify 的拉取源）」。
+name: sync-to-gitee
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push main -> Gitee master
+        env:
+          GITEE_USER: ${{ secrets.GITEE_USER }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          if [ -z "$GITEE_TOKEN" ]; then echo "未配置 GITEE_TOKEN，跳过同步"; exit 0; fi
+          git push --force "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/bei-qi-luo/voxbrush.git" HEAD:master
+          echo "已同步 main -> Gitee master"
