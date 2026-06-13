@@ -1,19 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { applyOps, initialScene, insertImageNode, render, sceneBrief } from './engine/scene';
+import { applyOps, getHistory, initialScene, insertImageNode, pushHistory, render, sceneBrief, setRenderLayer, takeRenderLayer } from './engine/scene';
 import { CANVAS_H, CANVAS_W, Op, SceneState } from './engine/types';
-import { needsVision, parseLocal } from './voice/parser';
+import { correctDomain, isReviewOrBeautify, needsVision, parseLocal } from './voice/parser';
 import { AsrEngine, ServerAsr, WebSpeechAsr } from './voice/asrClient';
-import { speak } from './voice/tts';
 import { callAgentStream } from './agent/client';
 
 type Lane = 'L0 本地' | 'L1 大模型' | 'L2 多模态';
-interface LogItem { id: number; text: string; lane?: Lane; ops?: number; ms?: number; asrMs?: number; firstMs?: number; err?: string; }
+interface LogItem { id: number; text: string; lane?: Lane; ops?: number; ms?: number; asrMs?: number; firstMs?: number; err?: string; corrected?: string; }
 
 const HELP_LINES = [
   '「画一个红色的圆」「在左上角画三颗星星」',
   '「写上 七牛云，字号四十」「背景换成深蓝色」',
   '「大一点 / 往左移五十 / 改成绿色 / 旋转四十五度」',
   '「画一座房子，旁边一棵树，天上一个太阳」（AI 拆解）',
+  '「再来一棵 / 一样的颜色」（有记忆的连续创作）',
+  '「记住这个叫小屋」→「在右边画两个小屋」（语音宏）',
+  '「评价一下我的画」「帮我美化构图」（AI 评画）',
+  '「把我的画渲染成水彩风」「来点吉卜力风格」（风格渲染，矢量仍可改）',
+  '「把那棵树变成真实的樱花树」（物体级 AI 重绘）',
   '「撤销 / 重做 / 清空 / 保存图片」',
 ];
 
@@ -25,7 +29,7 @@ export default function App() {
   const undoStack = useRef<SceneState[]>([]);
   const redoStack = useRef<SceneState[]>([]);
   const engineRef = useRef<AsrEngine | null>(null);
-  const busyRef = useRef(false);
+  const captionTimer = useRef<number | undefined>(undefined);
 
   const [started, setStarted] = useState(false);
   const [engineKind, setEngineKind] = useState<'server' | 'webspeech'>('server');
@@ -36,6 +40,7 @@ export default function App() {
   const [thinking, setThinking] = useState(false);
   const [showHelp, setShowHelp] = useState(true);
   const [objCount, setObjCount] = useState(0);
+  const [caption, setCaption] = useState('');
 
   // ---------- 渲染循环 ----------
   useEffect(() => {
@@ -56,11 +61,12 @@ export default function App() {
 
   const snapshotState = () => JSON.parse(JSON.stringify({ ...sceneRef.current })) as SceneState;
 
+  // 反馈改为屏幕字幕：不发声、不静音麦克风（彻底消除机器音、回声自激与「静音卡死导致画不出」）
   const say = useCallback((text: string) => {
-    speak(text, busy => {
-      busyRef.current = busy;
-      engineRef.current?.setMuted(busy);
-    });
+    if (!text) return;
+    setCaption(text);
+    window.clearTimeout(captionTimer.current);
+    captionTimer.current = window.setTimeout(() => setCaption(''), 2600);
   }, []);
 
   const pushLog = (item: Omit<LogItem, 'id'>) =>
@@ -76,7 +82,8 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             prompt: item.prompt,
-            size: item.as === 'background' ? '1024x576' : '512x512',
+            // Seedream 4.0 要求单边 ≥768；1280x800 与画布 8:5 同比
+            size: item.as === 'background' ? '1280x800' : '1024x1024',
           }),
           signal: AbortSignal.timeout(90000),
         });
@@ -92,10 +99,55 @@ export default function App() {
           w: item.w ?? (item.as === 'background' ? CANVAS_W : 200),
           h: item.h ?? (item.as === 'background' ? CANVAS_H : 150),
         });
+        // 物体级重绘：AI 图就位后删除被替换的原对象
+        if (item.replaceId) sceneRef.current.nodes = sceneRef.current.nodes.filter(n => n.id !== item.replaceId);
         setObjCount(sceneRef.current.nodes.length);
       } catch {
         say('图片生成超时了，继续用矢量素材');
       }
+    }
+  }, [say]);
+
+  // 风格化渲染：截当前矢量层快照 → img2img → 铺为 z=-50 渲染层（矢量对象保留可编辑）
+  const runRenderStyle = useCallback(async (rs: { style: string; strength?: number }) => {
+    if (sceneRef.current.nodes.filter(n => n.name !== '风格渲染').length === 0) {
+      say('先画点东西，再渲染风格吧'); return;
+    }
+    setThinking(true);
+    say(`正在渲染${rs.style}风格，大约十秒`);
+    // 取出旧渲染层 → 等一帧让画布只剩矢量层 → 截快照作条件图
+    const removed = takeRenderLayer(sceneRef.current);
+    await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+    let snapshot: string | undefined;
+    const c = canvasRef.current;
+    if (c) {
+      const small = document.createElement('canvas');
+      small.width = 960; small.height = 600;
+      small.getContext('2d')!.drawImage(c, 0, 0, 960, 600);
+      snapshot = small.toDataURL('image/jpeg', 0.85);
+    }
+    const sceneDesc = sceneRef.current.nodes.map(n => n.name || n.asset || n.shape).join('、');
+    try {
+      const res = await fetch('/api/render', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: snapshot, style: rs.style, sceneDesc }),
+        signal: AbortSignal.timeout(120000),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.url) {
+        if (removed) sceneRef.current.nodes.unshift(removed); // 还原旧渲染层
+        say('风格渲染暂时不可用，画面保持不变');
+        return;
+      }
+      setRenderLayer(sceneRef.current, json.url);
+      setObjCount(sceneRef.current.nodes.length);
+      say(`${rs.style}风格渲染好了，矢量对象还能继续修改`);
+    } catch {
+      if (removed) sceneRef.current.nodes.unshift(removed);
+      say('风格渲染超时了，画面保持不变');
+    } finally {
+      setThinking(false);
     }
   }, [say]);
 
@@ -115,24 +167,26 @@ export default function App() {
         else say('没有可以重做的了');
       } else rest.push(o);
     }
+    let applyResult: ReturnType<typeof applyOps> | null = null;
     if (rest.length) {
       undoStack.current.push(snapshotState());
       if (undoStack.current.length > 100) undoStack.current.shift();
       redoStack.current = [];
-      const { effects } = applyOps(sceneRef.current, rest);
+      applyResult = applyOps(sceneRef.current, rest);
+      const { effects } = applyResult;
       if (effects.generateImage?.length) await runGenerateImages(effects.generateImage);
+      if (effects.renderStyle) await runRenderStyle(effects.renderStyle);
       if (effects.save) downloadPng();
       if (effects.help) { setShowHelp(true); say('试试这些指令：画一个红色的圆，或者说，画一座房子和一棵树'); }
       const extra = effects.say?.length ? effects.say.join('，') : undefined;
       const final = reply ?? extra;
       if (final) say(final);
-      else if (extra) say(extra);
     } else if (reply) {
       say(reply);
     }
     setObjCount(sceneRef.current.nodes.length);
-    return Math.round(performance.now() - t0);
-  }, [say, runGenerateImages]);
+    return { ms: Math.round(performance.now() - t0), applyResult };
+  }, [say, runGenerateImages, runRenderStyle]);
 
   const downloadPng = () => {
     const c = canvasRef.current; if (!c) return;
@@ -142,18 +196,74 @@ export default function App() {
     a.click();
   };
 
+  // 暴露场景引用给宏系统
+  useEffect(() => {
+    (window as unknown as Record<string, unknown>).__voxbrush_scene = sceneRef.current;
+  });
+
   // ---------- 指令处理主流程 ----------
   const handleUtterance = useCallback(async (text: string, asrMs?: number) => {
-    const trimmed = text.trim();
-    if (trimmed.length < 2) return; // 噪声过滤
+    const raw = text.trim();
+    if (raw.length < 2) return; // 噪声过滤
     setPartial('');
     setShowHelp(false);
 
+    // 领域同音纠错（生图/水彩/渲染/吉卜力…）：下游统一用纠错后的文本，HUD 展示「原文 → 纠错后」
+    const trimmed = correctDomain(raw);
+    const correctedNote = trimmed !== raw ? `${raw} → ${trimmed}` : undefined;
+
     const t0 = performance.now();
+
+    // 评画/美化 → 必须走 L2 多模态
+    if (isReviewOrBeautify(trimmed) && sceneRef.current.nodes.length > 0) {
+      setThinking(true);
+      const snapshot = canvasRef.current?.toDataURL('image/jpeg', 0.7);
+      try {
+        await callAgentStream(trimmed, sceneBrief(sceneRef.current), snapshot, async ev => {
+          if (ev.type === 'op' && ev.op) {
+            // 美化：执行修改 ops（逐笔可见）
+            if (ev.op.op === 'modify' || ev.op.op === 'add' || ev.op.op === 'delete') {
+              // 首次美化操作前入撤销栈
+              if (!undoStack.current.length || undoStack.current[undoStack.current.length - 1] !== snapshotState()) {
+                undoStack.current.push(snapshotState());
+                if (undoStack.current.length > 100) undoStack.current.shift();
+                redoStack.current = [];
+              }
+              const { effects } = applyOps(sceneRef.current, [ev.op]);
+              if (effects.generateImage?.length) await runGenerateImages(effects.generateImage);
+              if (effects.renderStyle) await runRenderStyle(effects.renderStyle);
+              setObjCount(sceneRef.current.nodes.length);
+            } else if (ev.op.op === 'say') {
+              say(ev.op.text);
+            }
+          } else if (ev.type === 'done') {
+            if (ev.reply) say(ev.reply);
+            pushLog({ text: trimmed, lane: 'L2 多模态', ops: ev.ops?.length ?? 0, ms: Math.round(performance.now() - t0), asrMs, corrected: correctedNote });
+          } else if (ev.type === 'error') {
+            pushLog({ text: trimmed, lane: 'L2 多模态', err: ev.message, corrected: correctedNote });
+            say('云端大脑暂时联系不上，简单指令还是可以用的');
+          }
+        }, getHistory());
+      } catch (e) {
+        pushLog({ text: trimmed, lane: 'L2 多模态', err: (e as Error).message, corrected: correctedNote });
+        say('这个指令我没处理好，换个说法试试');
+      } finally {
+        setThinking(false);
+      }
+      return;
+    }
+
     const local = parseLocal(trimmed);
     if (local) {
-      const ms = await execute(local.ops, local.reply);
-      pushLog({ text: trimmed, lane: 'L0 本地', ops: local.ops.length, ms: Math.round(performance.now() - t0) + ms, asrMs });
+      const { ms, applyResult } = await execute(local.ops, local.reply);
+      // 使用 execute() 内部的 applyOps 结果，确保 lastAdd/objectIds 正确反映本轮操作
+      pushHistory({
+        utterance: trimmed,
+        lastAdd: applyResult?.lastAdd,
+        objectIds: applyResult?.objectIds ?? [],
+        opsSummary: local.ops.map(o => o.op).join(','),
+      });
+      pushLog({ text: trimmed, lane: 'L0 本地', ops: local.ops.length, ms: Math.round(performance.now() - t0) + ms, asrMs, corrected: correctedNote });
       return;
     }
 
@@ -176,39 +286,58 @@ export default function App() {
       redoStack.current = [];
     };
     const applyStreamOp = async (op: Op) => {
-      const { effects } = applyOps(sceneRef.current, [op]);
+      const { effects, lastAdd, objectIds: ids } = applyOps(sceneRef.current, [op]);
       if (effects.generateImage?.length) await runGenerateImages(effects.generateImage);
+      if (effects.renderStyle) await runRenderStyle(effects.renderStyle);
       if (effects.save) downloadPng();
       setObjCount(sceneRef.current.nodes.length);
+      return { lastAdd, ids };
     };
+
+    // 本轮收集（用于历史记录）
+    let roundLastAdd: ReturnType<typeof applyOps>['lastAdd'] = undefined;
+    const roundIds: string[] = [];
 
     try {
       await callAgentStream(trimmed, sceneBrief(sceneRef.current), snapshot, async ev => {
         if (ev.type === 'op' && ev.op) {
           if (!started) { beginBatch(); started = true; firstMs = Math.round(performance.now() - t0); }
-          await applyStreamOp(ev.op);
+          const r = await applyStreamOp(ev.op);
+          if (r.lastAdd) roundLastAdd = r.lastAdd;
+          if (r.ids) roundIds.push(...r.ids);
           opCount++;
         } else if (ev.type === 'done') {
           const rest = (ev.ops ?? []).slice(ev.emitted ?? opCount);
           if (rest.length) {
             if (!started) { beginBatch(); started = true; }
-            for (const o of rest) await applyStreamOp(o);
+            for (const o of rest) {
+              const r = await applyStreamOp(o);
+              if (r.lastAdd) roundLastAdd = r.lastAdd;
+              if (r.ids) roundIds.push(...r.ids);
+            }
             opCount += rest.length;
           }
+          // 记录历史
+          pushHistory({
+            utterance: trimmed,
+            lastAdd: roundLastAdd,
+            objectIds: roundIds,
+            opsSummary: (ev.ops ?? []).map((o: Op) => o.op).join(','),
+          });
           if (opCount || ev.reply) say(ev.reply ?? '画好了');
-          pushLog({ text: trimmed, lane, ops: opCount, ms: Math.round(performance.now() - t0), firstMs, asrMs });
+          pushLog({ text: trimmed, lane, ops: opCount, ms: Math.round(performance.now() - t0), firstMs, asrMs, corrected: correctedNote });
         } else if (ev.type === 'error') {
-          pushLog({ text: trimmed, lane, err: ev.message });
+          pushLog({ text: trimmed, lane, err: ev.message, corrected: correctedNote });
           say('云端大脑暂时联系不上，简单指令还是可以用的');
         }
-      });
+      }, getHistory());
     } catch (e) {
-      pushLog({ text: trimmed, lane, err: (e as Error).message });
+      pushLog({ text: trimmed, lane, err: (e as Error).message, corrected: correctedNote });
       say('这个指令我没处理好，换个说法试试');
     } finally {
       setThinking(false);
     }
-  }, [execute, say, runGenerateImages]);
+  }, [execute, say, runGenerateImages, runRenderStyle]);
 
   const handleRef = useRef(handleUtterance);
   handleRef.current = handleUtterance;
@@ -274,6 +403,7 @@ export default function App() {
             </div>
           )}
           {thinking && <div className="thinking">🧠 AI 正在拆解指令…</div>}
+          {caption && <div className="caption">{caption}</div>}
           {partial && <div className="partial">{partial}<span className="caret" /></div>}
         </div>
 
@@ -284,6 +414,7 @@ export default function App() {
             {[...logs].reverse().map(l => (
               <div className="log" key={l.id}>
                 <div className="log-text">“{l.text}”</div>
+                {l.corrected && <div className="log-fix" title="领域同音纠错">🔧 {l.corrected}</div>}
                 <div className="log-meta">
                   {l.lane && <span className="badge" style={{ background: laneColor(l.lane) }}>{l.lane}</span>}
                   {l.asrMs != null && <span className="kv">ASR {l.asrMs}ms</span>}

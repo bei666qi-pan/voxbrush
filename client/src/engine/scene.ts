@@ -1,8 +1,31 @@
-import { CANVAS_H, CANVAS_W, Gradient, Node, Op, SceneState, Target } from './types';
+import { CANVAS_H, CANVAS_W, Gradient, HistoryEntry, Node, Op, SceneState, Target, VoiceMacro } from './types';
 import { drawSprite, resolvePalette, SPRITES } from './assets';
 
 let seq = 0;
 const nid = () => `n${++seq}_${Date.now().toString(36)}`;
+
+/** 风格渲染层节点名（z=-50，矢量对象之下、背景之上；可被「去掉风格」移除） */
+export const RENDER_LAYER_NAME = '风格渲染';
+export const RENDER_LAYER_Z = -50;
+
+// ---------- 对话历史（多轮上下文） ----------
+const MAX_HISTORY = 8;
+let history: HistoryEntry[] = [];
+let lastAddSnapshot: HistoryEntry['lastAdd'] | null = null;
+
+export function pushHistory(entry: HistoryEntry) {
+  history.push(entry);
+  if (history.length > MAX_HISTORY) history.shift();
+  if (entry.lastAdd) lastAddSnapshot = entry.lastAdd;
+}
+
+export function getHistory(): HistoryEntry[] {
+  return history;
+}
+
+export function getLastAdd(): HistoryEntry['lastAdd'] | null {
+  return lastAddSnapshot;
+}
 
 const imageCache = new Map<string, HTMLImageElement>();
 const imagePending = new Map<string, Promise<HTMLImageElement>>();
@@ -94,13 +117,21 @@ export interface ApplyResult {
     say?: string[];
     save?: boolean;
     help?: boolean;
-    generateImage?: { prompt: string; as: 'background' | 'object'; x?: number; y?: number; w?: number; h?: number }[];
+    generateImage?: { prompt: string; as: 'background' | 'object'; x?: number; y?: number; w?: number; h?: number; replaceId?: string }[];
+    /** 风格化渲染：需前端截画布快照走 img2img，再铺为渲染层 */
+    renderStyle?: { style: string; strength?: number };
   };
+  /** 本轮 add 操作的摘要（用于历史记录和 L0 克隆） */
+  lastAdd?: HistoryEntry['lastAdd'];
+  /** 本轮涉及的对象 ID */
+  objectIds?: string[];
 }
 
 export function applyOps(s: SceneState, ops: Op[]): ApplyResult {
   const effects: ApplyResult['effects'] = { say: [] };
   let changed = false;
+  let lastAdd: HistoryEntry['lastAdd'] | null = null;
+  const objectIds: string[] = [];
   for (const op of ops) {
     switch (op.op) {
       case 'add': {
@@ -145,6 +176,20 @@ export function applyOps(s: SceneState, ops: Op[]): ApplyResult {
         }
         s.nodes.push(node);
         s.lastId = node.id; s.selectedId = node.id;
+        objectIds.push(node.id);
+        // 记录最后一个 add 操作的摘要（用于 L0 克隆）
+        lastAdd = {
+          shape: node.shape,
+          asset: node.asset,
+          fill: node.fill,
+          x: Math.round(node.x),
+          y: Math.round(node.y),
+          w: node.w ? Math.round(node.w) : undefined,
+          h: node.h ? Math.round(node.h) : undefined,
+          r: node.r ? Math.round(node.r) : undefined,
+          name: node.name,
+          palette: node.palette,
+        };
         changed = true;
         break;
       }
@@ -173,12 +218,14 @@ export function applyOps(s: SceneState, ops: Op[]): ApplyResult {
           if (op.delta.rotate) n.rotation = ((n.rotation ?? 0) + op.delta.rotate) % 360;
         }
         s.lastId = n.id; s.selectedId = n.id;
+        objectIds.push(n.id);
         changed = true;
         break;
       }
       case 'delete': {
         const n = resolveTarget(s, op.target);
         if (!n) { effects.say!.push('没找到要删除的对象'); break; }
+        objectIds.push(n.id);
         s.nodes = s.nodes.filter(x => x.id !== n.id);
         if (s.selectedId === n.id) s.selectedId = null;
         if (s.lastId === n.id) s.lastId = s.nodes[s.nodes.length - 1]?.id ?? null;
@@ -209,10 +256,35 @@ export function applyOps(s: SceneState, ops: Op[]): ApplyResult {
           x: op.x, y: op.y, w: op.w, h: op.h,
         });
         break;
+      case 'regen': {
+        // 物体级 AI 重绘：在目标对象原位/原尺寸生成 AI 图替换之
+        const n = resolveTarget(s, op.target);
+        if (!n) { effects.say!.push('没找到要重绘的对象'); break; }
+        const b = bbox(n);
+        effects.generateImage = effects.generateImage ?? [];
+        effects.generateImage.push({
+          prompt: op.prompt, as: 'object',
+          x: Math.round(n.x), y: Math.round(n.y),
+          w: Math.round(Math.max(120, b.w)), h: Math.round(Math.max(120, b.h)),
+          replaceId: n.id,
+        });
+        objectIds.push(n.id);
+        break;
+      }
+      case 'render_style':
+        if (op.style === 'none' || op.style === '还原' || op.style === '取消') {
+          const before = s.nodes.length;
+          s.nodes = s.nodes.filter(n => n.name !== RENDER_LAYER_NAME);
+          if (s.nodes.length !== before) { changed = true; effects.say!.push('已去掉风格，回到矢量画面'); }
+          else effects.say!.push('当前没有风格渲染层');
+        } else {
+          effects.renderStyle = { style: op.style, strength: op.strength };
+        }
+        break;
       default: break;
     }
   }
-  return { changed, effects };
+  return { changed, effects, lastAdd: lastAdd ?? undefined, objectIds };
 }
 
 /** Insert an image node after API generation */
@@ -234,6 +306,37 @@ export function insertImageNode(s: SceneState, src: string, opts: { as: 'backgro
   s.nodes.push(node);
   s.lastId = node.id;
   loadImage(src).catch(() => {});
+  return node;
+}
+
+/** 铺设/替换风格渲染层（z=-50，全画布，矢量对象之上保留可编辑） */
+export function setRenderLayer(s: SceneState, src: string) {
+  // 移除旧渲染层，保证只有一层皮肤
+  s.nodes = s.nodes.filter(n => n.name !== RENDER_LAYER_NAME);
+  const node: Node = {
+    id: nid(), shape: 'image', src,
+    x: CANVAS_W / 2, y: CANVAS_H / 2,
+    w: CANVAS_W, h: CANVAS_H,
+    z: RENDER_LAYER_Z,
+    name: RENDER_LAYER_NAME,
+    bornAt: performance.now(),
+  };
+  // 渲染层置于数组最前，但靠 z 决定绘制顺序，矢量对象（z>=0）仍在其上
+  s.nodes.unshift(node);
+  loadImage(src).catch(() => {});
+  return node;
+}
+
+/** 当前画布是否已有风格渲染层 */
+export function hasRenderLayer(s: SceneState): boolean {
+  return s.nodes.some(n => n.name === RENDER_LAYER_NAME);
+}
+
+/** 截取「矢量层」快照前，临时取出渲染层节点（避免风格在多次渲染间叠加） */
+export function takeRenderLayer(s: SceneState): Node | null {
+  const idx = s.nodes.findIndex(n => n.name === RENDER_LAYER_NAME);
+  if (idx < 0) return null;
+  const [node] = s.nodes.splice(idx, 1);
   return node;
 }
 
@@ -346,7 +449,7 @@ function drawShape(ctx: CanvasRenderingContext2D, n: Node) {
     if (n.gradient) ctx.fillStyle = buildGradient(ctx, n.gradient, 200, 200);
     else ctx.fillStyle = n.fill ?? 'transparent';
     ctx.fill(path);
-    if (n.stroke && n.strokeWidth) {
+    if (n.stroke && n.stroke !== 'none' && n.strokeWidth) {
       ctx.strokeStyle = n.stroke;
       ctx.lineWidth = (n.strokeWidth ?? 1) / Math.min(scaleX, scaleY);
       ctx.stroke(path);
@@ -356,7 +459,10 @@ function drawShape(ctx: CanvasRenderingContext2D, n: Node) {
   }
 
   ctx.fillStyle = n.gradient ? buildGradient(ctx, n.gradient, w, h) : (n.fill ?? 'transparent');
-  ctx.strokeStyle = n.stroke ?? 'transparent';
+  // "none" 是无效 CSS 颜色值，浏览器会忽略该赋值并保持上一次的 strokeStyle（通常为黑色）
+  // 需显式转换为 'transparent' 以防止意外描边
+  const effectiveStroke = (!n.stroke || n.stroke === 'none') ? 'transparent' : n.stroke;
+  ctx.strokeStyle = effectiveStroke;
   ctx.lineWidth = n.strokeWidth ?? 0;
   ctx.lineCap = 'round';
   const path = new Path2D();
@@ -395,12 +501,12 @@ function drawShape(ctx: CanvasRenderingContext2D, n: Node) {
       ctx.font = `${n.fontSize ?? 36}px 'PingFang SC','Microsoft YaHei',sans-serif`;
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       if (n.fill) ctx.fillText(n.text ?? '', 0, 0);
-      if (n.stroke && n.strokeWidth) ctx.strokeText(n.text ?? '', 0, 0);
+      if (n.stroke && n.stroke !== 'none' && n.strokeWidth) ctx.strokeText(n.text ?? '', 0, 0);
       return;
     }
   }
   if (n.fill || n.gradient) ctx.fill(path);
-  if (n.stroke && n.strokeWidth) ctx.stroke(path);
+  if (n.stroke && n.stroke !== 'none' && n.strokeWidth) ctx.stroke(path);
 }
 
 function roundRect(p: Path2D, x: number, y: number, w: number, h: number, r: number) {
@@ -448,4 +554,94 @@ export function sceneBrief(s: SceneState) {
     w: n.w && Math.round(n.w), h: n.h && Math.round(n.h), r: n.r && Math.round(n.r),
     text: n.text,
   }));
+}
+
+// ---------- 语音宏（localStorage 持久化） ----------
+const MACRO_KEY = 'voxbrush_macros';
+const hasLocalStorage = typeof localStorage !== 'undefined';
+
+function loadMacros(): Record<string, VoiceMacro> {
+  if (!hasLocalStorage) return {};
+  try {
+    const raw = localStorage.getItem(MACRO_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch { return {}; }
+}
+
+function saveMacros(macros: Record<string, VoiceMacro>) {
+  if (!hasLocalStorage) return;
+  try { localStorage.setItem(MACRO_KEY, JSON.stringify(macros)); } catch { /* quota exceeded */ }
+}
+
+export function createMacro(name: string, nodes: Node[]): boolean {
+  if (!nodes.length) return false;
+  const macros = loadMacros();
+  // 计算中心点
+  let cx = 0, cy = 0;
+  nodes.forEach(n => { cx += n.x; cy += n.y; });
+  cx /= nodes.length; cy /= nodes.length;
+  macros[name] = {
+    name,
+    entries: nodes.map(n => ({
+      shape: n.shape,
+      asset: n.asset,
+      dx: Math.round(n.x - cx),
+      dy: Math.round(n.y - cy),
+      w: Math.round(n.w ?? (n.r ? n.r * 2 : 120)),
+      h: Math.round(n.h ?? (n.shape === 'circle' ? n.r! * 2 : n.w ?? 120)),
+      r: n.r ? Math.round(n.r) : undefined,
+      fill: n.fill,
+      palette: n.palette,
+      name: n.name,
+      z: n.z,
+    })),
+  };
+  saveMacros(macros);
+  return true;
+}
+
+export function deleteMacro(name: string): boolean {
+  const macros = loadMacros();
+  if (!macros[name]) return false;
+  delete macros[name];
+  saveMacros(macros);
+  return true;
+}
+
+export function getMacro(name: string): VoiceMacro | null {
+  return loadMacros()[name] ?? null;
+}
+
+export function listMacros(): string[] {
+  return Object.keys(loadMacros());
+}
+
+export function macroExists(name: string): boolean {
+  return name in loadMacros();
+}
+
+/** 回放宏：生成 add ops（中心在 cx,cy），支持缩放 k */
+export function replayMacro(name: string, cx: number, cy: number, k: number, count: number): Op[] {
+  const macro = getMacro(name);
+  if (!macro) return [];
+  const ops: Op[] = [];
+  for (let i = 0; i < count; i++) {
+    const offsetX = (i - (count - 1) / 2) * 150 * k;
+    for (const e of macro.entries) {
+      const props: Record<string, unknown> = {
+        x: cx + e.dx * k + offsetX,
+        y: cy + e.dy * k,
+        w: e.w * k,
+        h: e.h * k,
+        fill: e.fill,
+        palette: e.palette,
+        z: e.z,
+      };
+      if (e.r) props.r = e.r * k;
+      if (e.asset) { props.asset = e.asset; props.name = e.name ?? macro.name; }
+      ops.push({ op: 'add', shape: e.shape, props } as Op);
+    }
+  }
+  ops.push({ op: 'say', text: `好的，${count > 1 ? count + '个' : ''}${name}画好了` });
+  return ops;
 }

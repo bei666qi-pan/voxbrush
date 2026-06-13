@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { initAsr, asrStatus, attachAsrSocket } from './asr.js';
 import { understand, understandStream } from './agent.js';
-import { arkStatus, generateImage, initImageModel } from './volc.js';
+import { arkStatus, generateImage, renderStyle, initImageModel } from './volc.js';
 import { ensureDns, dnsStatus } from './dns.js';
 
 const PORT = Number(process.env.PORT || 8080);
@@ -22,10 +22,10 @@ app.use(express.json({ limit: '8mb' }));
 const distDir = path.resolve(process.cwd(), 'public');
 
 app.post('/api/agent', async (req, res) => {
-  const { text, scene, snapshot } = req.body ?? {};
+  const { text, scene, snapshot, history } = req.body ?? {};
   if (!text || typeof text !== 'string') return res.status(400).json({ error: 'text 必填' });
   try {
-    const result = await understand({ text: text.slice(0, 500), scene, snapshot });
+    const result = await understand({ text: text.slice(0, 500), scene, snapshot, history });
     res.json(result);
   } catch (e) {
     console.error('[agent]', e.message);
@@ -35,7 +35,7 @@ app.post('/api/agent', async (req, res) => {
 
 /** v1.1：SSE 流式拆解 —— 边生成边下发 op，前端逐笔绘制 */
 app.post('/api/agent/stream', async (req, res) => {
-  const { text, scene, snapshot } = req.body ?? {};
+  const { text, scene, snapshot, history } = req.body ?? {};
   if (!text || typeof text !== 'string') return res.status(400).json({ error: 'text 必填' });
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -45,7 +45,7 @@ app.post('/api/agent/stream', async (req, res) => {
   });
   const send = ev => res.write(`data: ${JSON.stringify(ev)}\n\n`);
   try {
-    await understandStream({ text: text.slice(0, 500), scene, snapshot }, send);
+    await understandStream({ text: text.slice(0, 500), scene, snapshot, history }, send);
   } catch (e) {
     console.error('[agent/stream]', e.message);
     send({ type: 'error', message: e.message });
@@ -62,6 +62,23 @@ app.post('/api/image', async (req, res) => {
     res.json(result);
   } catch (e) {
     console.error('[image]', e.message);
+    res.status(502).json({ error: e.message, degraded: true });
+  }
+});
+
+/** 风格化渲染层（img2img 把矢量画布渲染为某种画风皮肤；失败优雅降级，不影响矢量层） */
+app.post('/api/render', async (req, res) => {
+  const { image, style, sceneDesc } = req.body ?? {};
+  if (!style || typeof style !== 'string') return res.status(400).json({ error: 'style 必填' });
+  try {
+    const result = await renderStyle({
+      image: typeof image === 'string' ? image : undefined,
+      style: style.slice(0, 40),
+      sceneDesc: String(sceneDesc ?? '').slice(0, 500),
+    });
+    res.json(result);
+  } catch (e) {
+    console.error('[render]', e.message);
     res.status(502).json({ error: e.message, degraded: true });
   }
 });
