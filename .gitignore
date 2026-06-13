@@ -6,3 +6,4 @@ server/models/
 .DS_Store
 .env
 .env.*
+vite.config.ts.timestamp-*.mjs

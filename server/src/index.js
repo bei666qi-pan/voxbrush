@@ -87,7 +87,7 @@ app.get('/api/health', async (_req, res) => {
   const ark = await arkStatus().catch(e => ({ auth: 'failed', authError: e.message }));
   res.json({
     name: 'voxbrush',
-    version: process.env.APP_VERSION || '1.2.0',
+    version: process.env.APP_VERSION || '1.6.0',
     time: new Date().toISOString(),
     asr: asrStatus(),
     ark,

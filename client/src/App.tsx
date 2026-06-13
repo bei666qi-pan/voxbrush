@@ -8,18 +8,29 @@ import { callAgentStream } from './agent/client';
 type Lane = 'L0 本地' | 'L1 大模型' | 'L2 多模态';
 interface LogItem { id: number; text: string; lane?: Lane; ops?: number; ms?: number; asrMs?: number; firstMs?: number; err?: string; corrected?: string; }
 
-const HELP_LINES = [
-  '「画一个红色的圆」「在左上角画三颗星星」',
-  '「写上 七牛云，字号四十」「背景换成深蓝色」',
-  '「大一点 / 往左移五十 / 改成绿色 / 旋转四十五度」',
-  '「画一座房子，旁边一棵树，天上一个太阳」（AI 拆解）',
-  '「再来一棵 / 一样的颜色」（有记忆的连续创作）',
-  '「记住这个叫小屋」→「在右边画两个小屋」（语音宏）',
-  '「评价一下我的画」「帮我美化构图」（AI 评画）',
-  '「把我的画渲染成水彩风」「来点吉卜力风格」（风格渲染，矢量仍可改）',
-  '「把那棵树变成真实的樱花树」（物体级 AI 重绘）',
-  '「撤销 / 重做 / 清空 / 保存图片」',
+// 面向用户的友好通道名（淡化 L0/L1/L2 技术术语）
+const LANE_LABEL: Record<Lane, string> = {
+  'L0 本地': '即时响应',
+  'L1 大模型': 'AI 构图',
+  'L2 多模态': '看图理解',
+};
+
+// 帮助卡片：图标 + 文案，比纯文字列表更有产品感
+const HELP_ITEMS: { ico: string; html: string }[] = [
+  { ico: '✏️', html: '“画一个红色的圆” · “在左上角画三颗星星”' },
+  { ico: '🔤', html: '“写上七牛云，字号四十” · “背景换成深蓝色”' },
+  { ico: '🎚️', html: '“大一点” · “往左移五十” · “改成绿色” · “旋转四十五度”' },
+  { ico: '🏠', html: '“画一座房子，旁边一棵树，天上一个太阳”（自动拆解构图）' },
+  { ico: '🔄', html: '“再来一棵” · “一样的颜色”（记得上一步，连续创作）' },
+  { ico: '📦', html: '“记住这个叫小屋” → “在右边画两个小屋”（语音快捷组合）' },
+  { ico: '🎨', html: '“评价一下我的画” · “帮我美化构图”（AI 逐笔优化）' },
+  { ico: '🖌️', html: '“渲染成水彩风” · “来点吉卜力风格”（风格化，原图仍可改）' },
+  { ico: '🪄', html: '“把那棵树变成真实的樱花树”（只重绘指定的那一个）' },
+  { ico: '↩️', html: '“撤销” · “重做” · “清空” · “保存图片”' },
 ];
+
+// 首屏示例气泡
+const EXAMPLE_CHIPS = ['画一个红色的圆', '画一座房子和一棵树', '渲染成水彩风', '写上七牛云'];
 
 let logSeq = 0;
 
@@ -32,6 +43,7 @@ export default function App() {
   const captionTimer = useRef<number | undefined>(undefined);
 
   const [started, setStarted] = useState(false);
+  const [authorizing, setAuthorizing] = useState(false);
   const [engineKind, setEngineKind] = useState<'server' | 'webspeech'>('server');
   const [state, setState] = useState<string>('未连接');
   const [level, setLevel] = useState(0);
@@ -39,8 +51,12 @@ export default function App() {
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [thinking, setThinking] = useState(false);
   const [showHelp, setShowHelp] = useState(true);
+  const [showTech, setShowTech] = useState(false); // 技术细节默认折叠，淡化术语
   const [objCount, setObjCount] = useState(0);
   const [caption, setCaption] = useState('');
+
+  // 是否正在聆听（用于动态文案与状态点）
+  const listening = started && state === 'listening';
 
   // ---------- 渲染循环 ----------
   useEffect(() => {
@@ -145,7 +161,7 @@ export default function App() {
       say(`${rs.style}风格渲染好了，矢量对象还能继续修改`);
     } catch {
       if (removed) sceneRef.current.nodes.unshift(removed);
-      say('风格渲染超时了，画面保持不变');
+      say('风格渲染超时了、画面保持不变');
     } finally {
       setThinking(false);
     }
@@ -196,7 +212,7 @@ export default function App() {
     a.click();
   };
 
-  // 暴露场景引用给宏系统
+  // 暴露场景引用给它系统
   useEffect(() => {
     (window as unknown as Record<string, unknown>).__voxbrush_scene = sceneRef.current;
   });
@@ -345,6 +361,7 @@ export default function App() {
   // ---------- 启动语音 ----------
   const startVoice = useCallback(async (kind: 'server' | 'webspeech') => {
     engineRef.current?.stop();
+    if (kind === 'server') setAuthorizing(true);
     const ev = {
       onPartial: (t: string) => setPartial(t),
       onFinal: (t: string, ms?: number) => handleRef.current(t, ms),
@@ -357,29 +374,43 @@ export default function App() {
       engineRef.current = engine;
       setEngineKind(kind);
       setStarted(true);
+      setAuthorizing(false);
       say('声笔已就绪，直接说出你想画的，比如：画一个红色的圆');
     } catch (e) {
       setState(`启动失败: ${(e as Error).message}`);
       if (kind === 'server') {
-        try { await startVoice('webspeech'); } catch { /* both failed */ }
+        try { await startVoice('webspeech'); } catch { setAuthorizing(false); }
+      } else {
+        setAuthorizing(false);
       }
     }
   }, [say]);
 
   const laneColor = (lane?: Lane) =>
-    lane === 'L0 本地' ? 'var(--ok)' : lane === 'L1 大模型' ? 'var(--q-blue)' : '#9b59b6';
+    lane === 'L0 本地' ? 'var(--ok)' : lane === 'L1 大模型' ? 'var(--brand)' : 'var(--violet)';
+
+  // 动态状态文案：未启动 → 授权中 → 聆听中 / 处理中
+  const statusText = !started
+    ? (authorizing ? '正在请求麦克风…' : '点击开始')
+    : thinking ? '正在思考…'
+    : listening ? '正在聆听'
+    : state;
 
   return (
     <div className="app">
       <header className="topbar">
         <img src="/logo.svg" alt="声笔 VoxBrush" className="logo" />
         <div className="spacer" />
-        <span className={`status ${state === 'listening' ? 'on' : ''}`}>
-          <span className="dot" />{started ? (state === 'listening' ? '正在聆听' : state) : '待启动'}
+        <span className={`status ${listening ? 'on' : ''}`}>
+          <span className="dot" />{statusText}
         </span>
-        <div className="meter"><div className="meter-fill" style={{ width: `${Math.min(100, level * 260)}%` }} /></div>
-        <span className="chip">{engineKind === 'server' ? '本地流式 ASR' : 'Web Speech'}</span>
-        <span className="chip">对象 {objCount}</span>
+        {started && (
+          <div className="meter" title="麦克风音量">
+            <div className="meter-fill" style={{ width: `${Math.min(100, level * 260)}%` }} />
+          </div>
+        )}
+        <span className="chip"><span className="chip-ico">🎙️</span>{engineKind === 'server' ? '语音引擎' : '浏览器语音'}</span>
+        <span className="chip">画面 {objCount} 个元素</span>
       </header>
 
       <main className="stage">
@@ -387,47 +418,92 @@ export default function App() {
           <canvas ref={canvasRef} style={{ width: CANVAS_W, height: CANVAS_H }} />
           {!started && (
             <div className="overlay">
-              <img src="/favicon.svg" width={84} alt="" />
+              <span className="overlay-badge"><span className="pip" />七牛云校招挑战作品 · 纯语音 AI 绘图</span>
+              <img className="overlay-logo" src="/favicon.svg" width={80} alt="" />
               <h1>声笔 VoxBrush</h1>
-              <p>纯语音控制的 AI 绘图工具 —— 不碰鼠标，不碰键盘，开口即画。</p>
-              <button className="primary" onClick={() => startVoice('server')}>
-                🎙️ 授权麦克风并开始（唯一一次点击）
+              <p>不碰鼠标，不碰键盘 —— 开口即画。<br />授权一次麦克风，之后全程用语音创作。</p>
+              <button className="primary" disabled={authorizing} onClick={() => startVoice('server')}>
+                {authorizing ? (
+                  <><span className="mic-pulse" />正在请求麦克风权限…</>
+                ) : (
+                  <><span className="mic-ring">🎙️</span>开启麦克风，开始创作</>
+                )}
               </button>
-              <small>授权后全程语音操作 · 说"帮助"查看能力</small>
+              <small>{authorizing ? '请在浏览器弹窗中点击“允许”' : '仅需授权一次 · 随时说“帮助”查看更多玩法'}</small>
+              {!authorizing && (
+                <div className="overlay-hints">
+                  {EXAMPLE_CHIPS.map(c => <span className="eg" key={c}>“{c}”</span>)}
+                </div>
+              )}
             </div>
           )}
           {showHelp && started && (
             <div className="help">
-              <b>你可以这样说：</b>
-              {HELP_LINES.map(l => <div key={l}>{l}</div>)}
+              <div className="help-head">
+                <b>试试这样说</b>
+                <button className="help-close" title="收起" onClick={() => setShowHelp(false)}>×</button>
+              </div>
+              <div className="help-grid">
+                {HELP_ITEMS.map(it => (
+                  <div className="row" key={it.html}>
+                    <span className="ico">{it.ico}</span>
+                    <span className="txt">{it.html}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
-          {thinking && <div className="thinking">🧠 AI 正在拆解指令…</div>}
+          {thinking && <div className="thinking"><span className="spin" />AI 正在理解你的想法…</div>}
           {caption && <div className="caption">{caption}</div>}
-          {partial && <div className="partial">{partial}<span className="caret" /></div>}
+          {partial && <div className="partial"><span className="lead">听到</span>{partial}<span className="caret" /></div>}
         </div>
 
         <aside className="console">
-          <div className="console-title">指令流水 <small>(语音→理解→执行 全链路延迟)</small></div>
+          <div className="console-title">
+            <span className="ct-ico">✨</span>
+            创作记录
+            <small>每一句话如何变成画面</small>
+          </div>
           <div className="log-list">
-            {logs.length === 0 && <div className="log-empty">等待你的第一条语音指令…</div>}
+            {logs.length === 0 && (
+              <div className="log-empty">
+                <span className="le-ico">🎤</span>
+                说出你的第一句话，<br />这里会记录每次创作的过程
+              </div>
+            )}
             {[...logs].reverse().map(l => (
               <div className="log" key={l.id}>
                 <div className="log-text">“{l.text}”</div>
-                {l.corrected && <div className="log-fix" title="领域同音纠错">🔧 {l.corrected}</div>}
+                {l.corrected && <div className="log-fix" title="语音识别智能纠错">✓ 已纠正：{l.corrected}</div>}
                 <div className="log-meta">
-                  {l.lane && <span className="badge" style={{ background: laneColor(l.lane) }}>{l.lane}</span>}
-                  {l.asrMs != null && <span className="kv">ASR {l.asrMs}ms</span>}
-                  {!!l.firstMs && <span className="kv">首笔 {l.firstMs}ms</span>}
-                  {l.ms != null && <span className="kv">理解+执行 {l.ms}ms</span>}
-                  {l.ops != null && <span className="kv">{l.ops} ops</span>}
-                  {l.err && <span className="kv err">{l.err.slice(0, 60)}</span>}
+                  {l.lane && (
+                    <span className="badge" style={{ background: laneColor(l.lane) }}>
+                      <span className="bdot" />{LANE_LABEL[l.lane]}
+                    </span>
+                  )}
+                  {l.ms != null && <span className="kv">{(l.ms / 1000).toFixed(1)}s</span>}
+                  {l.err && <span className="kv err">未能完成</span>}
+                  {/* 工程指标仅在展开技术细节时显示 */}
+                  {showTech && l.asrMs != null && <span className="kv">识别 {l.asrMs}ms</span>}
+                  {showTech && !!l.firstMs && <span className="kv">首笔 {l.firstMs}ms</span>}
+                  {showTech && l.ops != null && <span className="kv">{l.ops} ops</span>}
+                  {showTech && l.err && <span className="kv err">{l.err.slice(0, 60)}</span>}
                 </div>
               </div>
             ))}
           </div>
+          {logs.length > 0 && (
+            <div className={`tech-toggle ${showTech ? 'open' : ''}`} onClick={() => setShowTech(t => !t)}>
+              <span>{showTech ? '隐藏技术细节' : '查看技术细节'}（识别耗时 · 首笔延迟 · 原语数）</span>
+              <span className="tt-arrow">⌄</span>
+            </div>
+          )}
           <footer className="foot">
-            七牛云校招挑战 · <a href="https://github.com/bei666qi-pan/voxbrush" target="_blank" rel="noreferrer">GitHub</a> · <a href="/api/health" target="_blank">健康自检</a>
+            七牛云校招挑战
+            <span className="sep">·</span>
+            <a href="https://github.com/bei666qi-pan/voxbrush" target="_blank" rel="noreferrer">GitHub</a>
+            <span className="sep">·</span>
+            <a href="/api/health" target="_blank">运行状态</a>
           </footer>
         </aside>
       </main>
