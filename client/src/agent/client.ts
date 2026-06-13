@@ -1,4 +1,4 @@
-import { Op } from '../engine/types';
+import { HistoryEntry, Op } from '../engine/types';
 
 export interface AgentResult { ops: Op[]; reply?: string; llmMs?: number; model?: string; error?: string; }
 
@@ -11,11 +11,12 @@ export interface StreamEvent {
 export async function callAgentStream(
   text: string, scene: unknown[], snapshot: string | undefined,
   onEvent: (ev: StreamEvent) => void | Promise<void>,
+  history?: HistoryEntry[],
 ): Promise<void> {
   const res = await fetch('/api/agent/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, scene, snapshot }),
+    body: JSON.stringify({ text, scene, snapshot, history }),
     signal: AbortSignal.timeout(90000),
   });
   if (!res.ok || !res.body) {

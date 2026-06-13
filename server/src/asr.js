@@ -3,12 +3,32 @@
  * 每个 WebSocket 连接一个解码流；带端点检测（说完自动产出 final）。
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 
 const MODEL_DIR = process.env.ASR_MODEL_DIR || path.resolve(process.cwd(), 'models/asr');
+
+// 绘图领域热词：提高生僻指令/素材/风格词的识别率（与前端同音纠错双层兜底，零网络延迟）
+const HOTWORDS = [
+  '生图', '渲染', '水彩', '油画', '吉卜力', '素描', '像素', '扁平', '写实', '卡通', '动漫', '水墨', '赛博朋克', '风格', '滤镜',
+  '撤销', '重做', '清空', '保存', '背景', '旋转', '放大', '缩小', '删除', '选中', '美化', '评价',
+  '房子', '小屋', '松树', '太阳', '月亮', '彩虹', '雪人', '气球', '小鸟', '小鱼', '小船', '汽车',
+  '圆形', '三角形', '五角星', '星星', '爱心', '矩形', '椭圆', '箭头', '直线',
+  '红色', '橙色', '黄色', '绿色', '蓝色', '紫色', '粉色', '黑色', '白色',
+];
+
+/** 生成 sherpa-onnx 热词文件：中文按建模单元（字）拆分，每行一个词 */
+function buildHotwordsFile() {
+  const lines = HOTWORDS
+    .filter(w => /^[一-龥]+$/.test(w))
+    .map(w => w.split('').join(' '));
+  const file = path.join(os.tmpdir(), 'voxbrush-hotwords.txt');
+  fs.writeFileSync(file, lines.join('\n') + '\n', 'utf8');
+  return file;
+}
 
 function pick(dir, patterns) {
   const files = fs.readdirSync(dir);
@@ -21,6 +41,8 @@ function pick(dir, patterns) {
 
 let recognizer = null;
 let loadError = null;
+let decodingMethod = null;
+let hotwordsActive = false;
 
 export function initAsr() {
   try {
@@ -32,7 +54,8 @@ export function initAsr() {
     if (!encoder || !decoder || !joiner || !tokens) {
       throw new Error(`ASR 模型文件缺失于 ${MODEL_DIR}（需要 encoder/decoder/joiner/tokens）`);
     }
-    recognizer = new sherpa.OnlineRecognizer({
+    // 公共配置 + 端点规则：静音 2.4s（未开口）/ 0.8s（说完）/ 最长 25s
+    const base = {
       featConfig: { sampleRate: 16000, featureDim: 80 },
       modelConfig: {
         transducer: { encoder, decoder, joiner },
@@ -41,14 +64,39 @@ export function initAsr() {
         provider: 'cpu',
         debug: 0,
       },
-      decodingMethod: 'greedy_search',
       enableEndpoint: true,
-      // 端点规则：静音 2.4s（未开口）/ 0.8s（说完）/ 最长 25s
       rule1MinTrailingSilence: 2.4,
       rule2MinTrailingSilence: Number(process.env.ASR_TRAILING_SILENCE || 0.8),
       rule3MinUtteranceLength: 25,
-    });
-    console.log('[asr] sherpa-onnx 流式识别器已加载:', path.basename(encoder));
+    };
+
+    // 热词需要 modified_beam_search。先试热词配置，失败则回退 greedy（保持线上既有行为，绝不拖垮 ASR）。
+    const wantHotwords = process.env.ASR_DECODING !== 'greedy';
+    let hotwordsFile = null;
+    if (wantHotwords) { try { hotwordsFile = buildHotwordsFile(); } catch (e) { console.warn('[asr] 热词文件生成失败:', e.message); } }
+
+    if (hotwordsFile) {
+      try {
+        recognizer = new sherpa.OnlineRecognizer({
+          ...base,
+          decodingMethod: 'modified_beam_search',
+          maxActivePaths: Number(process.env.ASR_MAX_ACTIVE_PATHS || 4),
+          hotwordsFile,
+          hotwordsScore: Number(process.env.ASR_HOTWORDS_SCORE || 2.0),
+        });
+        decodingMethod = 'modified_beam_search';
+        hotwordsActive = true;
+      } catch (e) {
+        console.warn('[asr] 热词/modified_beam_search 不可用，回退 greedy_search:', e.message);
+        recognizer = null;
+      }
+    }
+    if (!recognizer) {
+      recognizer = new sherpa.OnlineRecognizer({ ...base, decodingMethod: 'greedy_search' });
+      decodingMethod = 'greedy_search';
+      hotwordsActive = false;
+    }
+    console.log(`[asr] sherpa-onnx 已加载: ${path.basename(encoder)} | ${decodingMethod}${hotwordsActive ? ` +热词×${HOTWORDS.length}` : ''}`);
   } catch (e) {
     loadError = e.message;
     console.error('[asr] 加载失败:', e.message);
@@ -57,7 +105,7 @@ export function initAsr() {
 }
 
 export function asrStatus() {
-  return { loaded: !!recognizer, error: loadError, modelDir: MODEL_DIR };
+  return { loaded: !!recognizer, error: loadError, modelDir: MODEL_DIR, decodingMethod, hotwords: hotwordsActive, hotwordsCount: hotwordsActive ? HOTWORDS.length : 0 };
 }
 
 /** 将一个 WS 连接接入流式识别 */

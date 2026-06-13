@@ -84,6 +84,16 @@ button.primary:hover { transform: translateY(-2px); }
 .caret { display: inline-block; width: 2px; height: 16px; background: #fff; margin-left: 4px; animation: blink 1s infinite; vertical-align: -2px; }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* 指令确认字幕（取代语音播报）：右下角轻提示，不遮挡画面 */
+.caption {
+  position: absolute; right: 16px; bottom: 16px;
+  background: rgba(46, 107, 230, .92); color: #fff; font-size: 14px; font-weight: 500;
+  padding: 8px 16px; border-radius: 12px; max-width: 60%;
+  box-shadow: 0 8px 22px rgba(36, 104, 242, .35);
+  animation: capIn .22s ease-out;
+}
+@keyframes capIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
 .console {
   flex: 1; min-width: 290px; display: flex; flex-direction: column;
   background: var(--card); border: 1px solid var(--line); border-radius: 16px;
@@ -95,6 +105,7 @@ button.primary:hover { transform: translateY(-2px); }
 .log-empty { color: var(--sub); font-size: 13px; padding: 18px 4px; }
 .log { border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; background: #fbfdff; }
 .log-text { font-size: 14px; margin-bottom: 6px; }
+.log-fix { font-size: 12px; color: var(--q-deep); background: rgba(46,107,230,.08); border-radius: 6px; padding: 2px 8px; margin-bottom: 6px; }
 .log-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .badge { color: #fff; font-size: 11px; padding: 2px 8px; border-radius: 999px; }
 .kv { font-size: 11px; color: var(--sub); background: var(--bg); padding: 2px 7px; border-radius: 6px; }

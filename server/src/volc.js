@@ -25,6 +25,7 @@ const VISION_CANDIDATES = (process.env.ARK_VISION_MODEL ? [process.env.ARK_VISIO
   'doubao-1-5-vision-pro-32k-250115',
 ]);
 const IMAGE_CANDIDATES = (process.env.ARK_IMAGE_MODEL ? [process.env.ARK_IMAGE_MODEL] : []).concat([
+  'doubao-seedream-4-0-250828',   // 本账号实测可用（文生图 + img2img）
   'doubao-seedream-4-0-250415',
   'doubao-seedream-4-0',
   'doubao-seedream-3-0-t2i-250415',
@@ -85,6 +86,7 @@ let epList = null; // [{ id, name, model, status }]
 let imageEp = null; // { id, model, version }
 let imageModelResolved = null;
 let imageModelError = null;
+let imageAuthOk = null; // null=未知, true=可生成, false=鉴权失败（铸钥 + 直签都不行）
 
 async function arkAdmin(ak, sk, action, body) {
   const { status, json } = await signedOpenApiRequest({
@@ -181,6 +183,12 @@ async function resolveImageModel() {
     imageModelError = '缺少凭证';
     throw new Error(imageModelError);
   }
+  // 持有账号级 ARK_API_KEY 时：直接用配置/候选的图像模型名调用，无需自建推理端点
+  if (process.env.ARK_API_KEY && IMAGE_CANDIDATES[0]) {
+    imageModelResolved = IMAGE_CANDIDATES[0];
+    imageModelError = null;
+    return imageModelResolved;
+  }
   try {
     if (ak && sk) await discoverEndpoints(ak, sk);
     const ep = ak && sk ? await discoverImageEndpoint(ak, sk) : null;
@@ -202,42 +210,136 @@ async function resolveImageModel() {
 }
 
 export function imageModelAvailable() {
-  return !!imageModelResolved || !!imageEp;
+  // 鉴权探测失败后不再对外宣称可用（L1 提示词据此移除生图能力，红线 #5）
+  return (!!imageModelResolved || !!imageEp) && imageAuthOk !== false;
 }
 
 export async function initImageModel() {
   try {
     await resolveImageModel();
-    console.log(`[volc] 图像模型就绪: ${imageModelResolved}`);
+    console.log(`[volc] 图像模型解析: ${imageModelResolved}，鉴权探测中…`);
+    // 启动探测：真实生成一张小图确认鉴权链路（铸钥/直签），让 imageModelAvailable 诚实
+    try {
+      await arkImagesGenerate({ model: imageModelResolved, prompt: '一个蓝色圆形', size: '1024x1024', response_format: 'url', n: 1 });
+      console.log('[volc] 图像生成鉴权 OK，生图能力已启用');
+    } catch (e) {
+      console.warn(`[volc] 图像生成鉴权失败（生图能力降级）: ${e.message}`);
+    }
   } catch (e) {
     console.warn(`[volc] 图像模型不可用（优雅降级）: ${e.message}`);
   }
 }
 
-export async function generateImage({ prompt, size = '1024x576' }) {
-  const model = await resolveImageModel();
-  const apiKey = await getArkApiKey();
-  const res = await fetch(`https://${ARK_HOST}/api/v3/images/generations`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      prompt: String(prompt).slice(0, 500),
-      size,
-      response_format: 'url',
-      n: 1,
-    }),
-    signal: AbortSignal.timeout(Number(process.env.ARK_IMAGE_TIMEOUT_MS || 90000)),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(json?.error?.message ?? `Image API ${res.status}`);
-    err.status = res.status;
-    throw err;
+function isAuthErr(status, json) {
+  if (status === 401 || status === 403) return true;
+  // 仅匹配真正的鉴权错误；不含通用 "invalid"（否则 size/model 参数错误会被误判为鉴权而触发无谓的直签回退）
+  return /api key|ak\/sk|unauthor|permission|access denied|not authorized|authentication/i.test(JSON.stringify(json?.error ?? json ?? ''));
+}
+
+/**
+ * 调 Ark images/generations：铸造的端点级 Bearer key 优先；遇鉴权失败（端点级临时 key
+ * 不覆盖基础图像模型时常见）则用 AK/SK SigV4 直签兜底。任一成功置 imageAuthOk=true。
+ */
+async function arkImagesGenerate(body) {
+  const timeout = Number(process.env.ARK_IMAGE_TIMEOUT_MS || 90000);
+  let lastErr = null, authFailed = false;
+  // 1) 铸造的临时 Bearer key
+  try {
+    const apiKey = await getArkApiKey();
+    const res = await fetch(`https://${ARK_HOST}/api/v3/images/generations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeout),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (res.ok && json?.data?.[0]?.url) { imageAuthOk = true; return json; }
+    lastErr = json?.error?.message || `image ${res.status}`;
+    authFailed = isAuthErr(res.status, json);
+    if (!authFailed) throw Object.assign(new Error(lastErr), { status: res.status });
+  } catch (e) {
+    if (e.status && !isAuthErr(e.status, {})) throw e; // 非鉴权错误直接抛
+    lastErr = e.message || lastErr;
+    authFailed = true;
   }
+  // 2) SigV4 直签兜底
+  if (authFailed && process.env.VOLC_AK && process.env.VOLC_SK) {
+    const res = await signedOpenApiRequest({
+      ak: process.env.VOLC_AK, sk: process.env.VOLC_SK,
+      service: 'ark', region: 'cn-beijing', host: ARK_HOST,
+      path: '/api/v3/images/generations', method: 'POST', body, rawResponse: true,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (res.ok && json?.data?.[0]?.url) { imageAuthOk = true; return json; }
+    imageAuthOk = false;
+    throw Object.assign(new Error(json?.error?.message || lastErr || `image signed ${res.status}`), { status: res.status });
+  }
+  imageAuthOk = false;
+  throw new Error(lastErr || '图像鉴权失败');
+}
+
+export async function generateImage({ prompt, size = '1280x800' }) {
+  const model = await resolveImageModel();
+  const json = await arkImagesGenerate({ model, prompt: String(prompt).slice(0, 500), size, response_format: 'url', n: 1 });
   const url = json?.data?.[0]?.url;
   if (!url) throw new Error('图像生成返回为空');
   return { url, model };
+}
+
+// 风格 → Seedream 提示词（控制"皮肤"，保留构图）
+const STYLE_PROMPTS = {
+  水彩: '水彩画风格，柔和晕染，纸张纹理，清新淡雅的笔触',
+  油画: '厚涂油画风格，明显的笔触肌理，丰富的色彩层次',
+  吉卜力: '吉卜力工作室动画风格，宫崎骏，柔和梦幻的色彩，治愈系手绘质感',
+  素描: '黑白铅笔素描风格，细腻的线条与明暗关系，纸面质感',
+  像素: '像素艺术风格，8-bit 复古游戏画面，分明的色块',
+  扁平: '扁平矢量插画风格，简洁的色块，现代设计感',
+  写实: '照片级写实风格，真实的光影与材质质感',
+  卡通: '卡通插画风格，明快的配色，圆润可爱的造型',
+  动漫: '日系动漫风格，鲜明的色彩，赛璐璐上色',
+  水墨: '中国水墨画风格，墨色浓淡相宜，留白与意境',
+  赛博朋克: '赛博朋克风格，霓虹灯光，未来都市氛围，高对比色调',
+  蜡笔: '儿童蜡笔画风格，粗犷的笔触，明亮的色彩',
+  梵高: '梵高油画风格，旋转的笔触，强烈的色彩对比',
+  印象派: '印象派绘画风格，斑驳的光色，朦胧的笔触',
+  极简: '极简主义风格，大量留白，克制的配色',
+  复古: '复古怀旧风格，胶片颗粒感，暖黄色调',
+  低多边形: '低多边形 low-poly 风格，几何切面，渐变配色',
+  蒸汽波: '蒸汽波 vaporwave 风格，粉紫霓虹，复古未来感',
+  粘土: '黏土定格动画风格，柔软的体积感与手作质感',
+  霓虹: '霓虹发光风格，暗背景上明亮的光线轮廓',
+  水晶: '水晶玻璃质感风格，通透折射，高光与反射',
+};
+
+/**
+ * 风格化渲染（img2img 优先，无图像编辑额度时退化为文生图）。
+ * @param image     画布矢量层快照（dataURL/base64 或 https URL），作 img2img 条件图
+ * @param style     规范风格名（水彩/吉卜力/…）或自由描述
+ * @param sceneDesc 场景文字描述，img2img 不可用时供文生图兜底
+ */
+export async function renderStyle({ image, style, sceneDesc = '', size = '1280x800' }) {
+  const model = await resolveImageModel();
+  const styleDesc = STYLE_PROMPTS[style] || `${style}风格`;
+  let imgErr = null;
+
+  // 1) 优先 img2img（Seedream 4.0 支持图像输入编辑）：保留构图、只换风格皮肤
+  if (image) {
+    const prompt = `把这张图改绘成${styleDesc}。严格保持原有的构图、物体位置、数量和整体布局不变，只改变画面的绘画风格与质感。`;
+    try {
+      const json = await arkImagesGenerate({ model, prompt, image, size, response_format: 'url', n: 1 });
+      const url = json?.data?.[0]?.url;
+      if (url) return { url, model, mode: 'img2img', style };
+    } catch (e) {
+      imgErr = e.message; // img2img 不支持/无额度 → 落文生图
+    }
+  }
+
+  // 2) 退化：文生图（用场景描述 + 风格重绘整幅）
+  const t2iPrompt = `${styleDesc}。画面内容：${sceneDesc || '一幅插画'}。完整构图，色彩和谐。`;
+  const json2 = await arkImagesGenerate({ model, prompt: t2iPrompt, size, response_format: 'url', n: 1 });
+  const url = json2?.data?.[0]?.url;
+  if (!url) throw new Error('风格渲染返回为空');
+  return { url, model, mode: 't2i', style, fallbackReason: imgErr };
 }
 
 export async function getArkApiKey() {
@@ -421,7 +523,8 @@ export async function arkStatus() {
     try { out.visionModel = await resolveModel('vision', VISION_CANDIDATES); } catch { /* noop */ }
     try {
       out.imageModel = await resolveImageModel();
-      out.imageAvailable = true;
+      out.imageAvailable = imageModelAvailable();
+      out.imageAuthOk = imageAuthOk;
     } catch (e) {
       out.imageAvailable = false;
       out.imageModelError = imageModelError ?? e.message;

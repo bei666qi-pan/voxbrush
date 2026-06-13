@@ -58,13 +58,59 @@ export type Op =
   | { op: 'save' }
   | { op: 'say'; text: string }
   | { op: 'help' }
-  | { op: 'generate_image'; prompt: string; as: 'background' | 'object'; x?: number; y?: number; w?: number; h?: number };
+  | { op: 'generate_image'; prompt: string; as: 'background' | 'object'; x?: number; y?: number; w?: number; h?: number }
+  // 风格化渲染层：把当前矢量画布快照作条件图，经 Seedream img2img 输出整幅风格皮肤，
+  // 铺为 z=-50 背景渲染层；矢量对象保留在上层继续可编辑。style='none' 表示去掉风格还原。
+  | { op: 'render_style'; style: string; strength?: number }
+  // 物体级 AI 重绘：把已寻址的对象替换成 AI 生成图（在其原位置/尺寸落图，删除原对象）。
+  // 利用「对象可寻址」优势，如「把那棵树变成真实的樱花树」。
+  | { op: 'regen'; target?: Target; prompt: string };
 
 export interface SceneState {
   nodes: Node[];
   background: string;
   selectedId: string | null;
   lastId: string | null;
+}
+
+/** 对话历史条目（用于多轮上下文消解） */
+export interface HistoryEntry {
+  utterance: string;
+  /** 最近一轮 add 操作的摘要：shape/asset/颜色/大致位置 */
+  lastAdd?: {
+    shape: Shape;
+    asset?: string;
+    fill?: string;
+    x?: number;
+    y?: number;
+    w?: number;
+    h?: number;
+    r?: number;
+    name?: string;
+    palette?: string[];
+  };
+  /** 该轮涉及的对象 ID 列表 */
+  objectIds: string[];
+  /** 该轮产生的所有 ops 摘要（用于代词消解） */
+  opsSummary?: string;
+}
+
+/** 语音宏定义（localStorage 持久化） */
+export interface VoiceMacro {
+  name: string;
+  entries: {
+    shape: Shape;
+    asset?: string;
+    dx: number;  // 相对宏中心的 x 偏移
+    dy: number;  // 相对宏中心的 y 偏移
+    w: number;
+    h: number;
+    r?: number;
+    fill?: string;
+    palette?: string[];
+    name?: string;
+    z?: number;
+  }[];
 }
 
 export const CANVAS_W = 960;
